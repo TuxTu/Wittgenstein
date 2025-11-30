@@ -3,7 +3,6 @@ import signal
 import sys
 from typing import List, Tuple, Optional
 
-from llm_cores import load_model, load_tokenizer, tokenize
 from .screen_buffer import ScreenBuffer
 
 
@@ -22,7 +21,7 @@ class InspectResult:
         # Pre-compute display tokens and indices
         self._tokens = []
         for (token_id, token_str) in token_seq:
-            display_token = token_str.replace('Ġ', ' ').replace('Ċ', '↵')
+            display_token = token_str.replace('Ġ', ' ').replace('Ċ', '\n').replace('ĉ', '\t')
             self._tokens.append((display_token, token_id))
         
         # Track last render info for redrawing
@@ -248,8 +247,7 @@ class PromptInspector:
             live_resize: If True, results redraw automatically on terminal resize
         """
         try:
-            print(f"\n\r[-] Initializing {model_id}...")
-            self.tokenizer = load_tokenizer(model_id)
+            print(f"\n\r[-] Initializing inspector for {model_id}...")
         except Exception as e:
             print(f"\n\r[!] Critical Error: {e}")
             raise
@@ -257,21 +255,20 @@ class PromptInspector:
         self.live_resize = live_resize
         self._live_display = LiveInspectDisplay.get() if live_resize else None
 
-    def inspect(self, prompt, live=None) -> InspectResult:
+    def inspect(self, prompt_item, live=None) -> InspectResult:
         """
         Tokenizes the supplied prompt and returns an InspectResult.
         
         The result dynamically re-renders based on terminal width whenever displayed.
         
         Args:
-            prompt: The text to tokenize
+            prompt_item: An object with .text and .tokens attributes (e.g. Prompt)
             live: Override live_resize setting for this call (None = use default)
             
         Returns:
             InspectResult that can be displayed multiple times with different widths
         """
-        token_seq = tokenize(self.tokenizer, prompt)
-        result = InspectResult(prompt, token_seq)
+        result = InspectResult(prompt_item.text, prompt_item.tokens)
         
         # Determine if we should use live display
         use_live = live if live is not None else self.live_resize

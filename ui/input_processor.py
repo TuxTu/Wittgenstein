@@ -171,6 +171,9 @@ class InputProcessor:
                 else:
                     # Not end sequence, add to buffer
                     paste_buffer.extend(seq)
+            elif ord(char) == 9:
+                # Convert tab to 4 spaces
+                paste_buffer.append('    ')
             elif ord(char) in [10, 13]:
                 # Convert newlines to spaces in pasted content
                 paste_buffer.append(' ')
@@ -374,6 +377,16 @@ class InputProcessor:
                         self._redraw_line(prompt_text, buffer, cursor_idx)
                     continue
 
+                # Tab key (9) - Insert 4 spaces
+                if ord(char) == 9:
+                    # for _ in range(4):
+                    #     buffer.insert(cursor_idx, ' ')
+                    #     cursor_idx += 1
+                    buffer.insert(cursor_idx, '    ')
+                    cursor_idx += 4
+                    self._redraw_line(prompt_text, buffer, cursor_idx)
+                    continue
+
                 buffer.insert(cursor_idx, char)
                 cursor_idx += 1
                 self._redraw_line(prompt_text, buffer, cursor_idx)
@@ -558,7 +571,7 @@ class InputProcessor:
                     else:
                         # Store the prompt and its inspection result
                         stored_prompt = self.env.add_prompt(prompt)
-                        stored_prompt.result = self.inspector.inspect(prompt)
+                        stored_prompt.result = self.inspector.inspect(stored_prompt)
 
                 except KeyboardInterrupt:
                     self._buffered_print("\nExiting...")
@@ -576,4 +589,3 @@ class InputProcessor:
                 termios.tcflush(sys.stdin, termios.TCIFLUSH)
             except (termios.error, AttributeError):
                 pass
-

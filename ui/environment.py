@@ -3,9 +3,10 @@ Execution environment for the REPL.
 """
 import sys
 import io
+import torch
 from typing import List, Any, Dict, Set
 
-from llm_cores import Prompt, PromptList, load_model
+from llm_cores import Prompt, PromptList, load_model, load_tokenizer, tokenize
 
 
 class HelpDisplay:
@@ -75,6 +76,7 @@ class ExecutionEnvironment:
     def __init__(self, inspector, model_id):
         self.inspector = inspector
         self.model_id = model_id
+        self.tokenizer = load_tokenizer(self.model_id)
         self.model = load_model(self.model_id)
         self.prompts = PromptList()
         
@@ -101,6 +103,13 @@ class ExecutionEnvironment:
             'inspect': self._inspect_wrapper,
             'inspector': self.inspector,
             
+            # Model access
+            'model': self.model,
+            'tokenizer': self.tokenizer,
+
+            # Generation access
+            'generate': self._generate_wrapper,
+            
             # Convenience functions
             'last': lambda: self.prompts.last,
             'help': HelpDisplay(self._show_help),
@@ -118,16 +127,23 @@ class ExecutionEnvironment:
         """
         self._is_silent_result = True
         if isinstance(text_or_prompt, Prompt):
-            result = self.inspector.inspect(text_or_prompt.text)
+            result = self.inspector.inspect(text_or_prompt)
             text_or_prompt.result = result
             return result
         elif isinstance(text_or_prompt, PromptList):
             results = ""
             for prompt in text_or_prompt:
-                result = self.inspector.inspect(prompt.text)
+                result = self.inspector.inspect(prompt)
                 results += repr(result)
             return results
     
+    def _generate_wrapper(self, prompt: Prompt):
+        """
+        Wrapper for model.generate that accepts a Prompt object.
+        """
+        input_ids = torch.tensor([prompt.token_ids], device=self.model.device)
+        return self.tokenizer.decode(self.model.generate(input_ids)[0], skip_special_tokens=True)
+
     def execute(self, code: str) -> str:
         """
         Execute code in the persistent namespace.
@@ -164,7 +180,8 @@ class ExecutionEnvironment:
     
     def add_prompt(self, text: str) -> Prompt:
         """Store a prompt from INSTRUCT mode."""
-        return self.prompts.add(text)
+        tokens = tokenize(self.tokenizer, text)
+        return self.prompts.add(text, tokens)
     
     def get_variable(self, name: str) -> Any:
         """Get a variable from the namespace."""
