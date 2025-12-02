@@ -16,6 +16,21 @@ class ComputationalNode:
     def __mul__(self, other):
         return BinaryOpNode(self, _ensure_node(other), torch.mul, "*")
 
+    def __truediv__(self, other):
+        return BinaryOpNode(self, _ensure_node(other), torch.div, "/")
+
+    def __radd__(self, other):
+        return BinaryOpNode(_ensure_node(other), self, torch.add, "+")
+
+    def __rsub__(self, other):
+        return BinaryOpNode(_ensure_node(other), self, torch.sub, "-")
+
+    def __rmul__(self, other):
+        return BinaryOpNode(_ensure_node(other), self, torch.mul, "*")
+
+    def __rtruediv__(self, other):
+        return BinaryOpNode(_ensure_node(other), self, torch.div, "/")
+
     def evaluate(self) -> torch.Tensor:
         """
         The trigger. strictly strictly forbidden to call this 
@@ -25,7 +40,7 @@ class ComputationalNode:
         raise NotImplementedError()
 
 # Helper to allow syntax like: prompt[0] + 5 (wraps 5 into a Node)
-def _ensure_node(obj: Union['ComputationalNode', int, float]) -> 'ComputationalNode':
+def _ensure_node(obj: Union['ComputationalNode', int, float, torch.Tensor]) -> 'ComputationalNode':
     if isinstance(obj, ComputationalNode):
         return obj
     return ConstantNode(obj)

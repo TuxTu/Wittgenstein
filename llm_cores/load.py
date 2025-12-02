@@ -1,7 +1,7 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-def load_model(model_id, device_map="auto", use_fp16=True):
+def load_model(model_id, use_fp16=True):
     """
     Loads a Hugging Face model with memory optimizations for local inference.
     
@@ -17,15 +17,29 @@ def load_model(model_id, device_map="auto", use_fp16=True):
     
     # Select precision
     dtype = torch.float16 if use_fp16 else torch.float32
+
+    if torch.cuda.is_available():
+        device = "cuda"
+        print("[-] NVIDIA GPU detected.")
+    # elif torch.backends.mps.is_available():
+    #     device = "mps"
+    #     print("[-] Apple Silicon (MPS) detected. Using GPU acceleration.")
+    else:
+        device = "cpu"
+        print("[!] No GPU detected. Falling back to CPU.")
     
     try:
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             dtype=dtype,
-            device_map=device_map,
+            device_map=device,
             trust_remote_code=True, # Needed for Qwen/custom architectures
             low_cpu_mem_usage=True  # Speeds up loading
         )
+
+        if device == "mps":
+            model.to(device)
+
         print(f"\r[+] Model loaded successfully on {model.device}")
         return model
     
