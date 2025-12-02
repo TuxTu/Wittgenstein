@@ -108,16 +108,20 @@ class BinaryOpNode(ComputationalNode):
         self.op_func = op_func
         self.op_symbol = op_symbol
 
+        self._runtime_cache: Optional[torch.Tensor] = None
+
     def evaluate(self) -> torch.Tensor:
         # This logic ONLY runs when the top-level evaluate() is triggered
         val_l = self.left.evaluate()
         val_r = self.right.evaluate()
         
-        if val_l is None or val_r is None:
+        if self._runtime_cache is not None:
+            return self._runtime_cache
+        elif val_l is None or val_r is None:
             return None
-
-        # Verify shapes are compatible if needed, or let Torch handle it
-        return self.op_func(val_l, val_r)
+        else:
+            self._runtime_cache = self.op_func(val_l, val_r)
+            return self._runtime_cache
         
     def __repr__(self):
         return f"({self.left} {self.op_symbol} {self.right})"

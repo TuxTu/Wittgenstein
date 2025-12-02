@@ -143,9 +143,9 @@ class ExecutionEnvironment:
     @staticmethod
     def _collect_leaves(node: ComputationalNode) -> List[ActivationRef]:
         leaves = []
-        if isinstance(node, ActivationRef):
+        if isinstance(node, ActivationRef) and node.evaluate() is None:
             leaves.append(node)
-        elif isinstance(node, BinaryOpNode):
+        elif isinstance(node, BinaryOpNode) and node.evaluate() is None:
             leaves.extend(ExecutionEnvironment._collect_leaves(node.left))
             leaves.extend(ExecutionEnvironment._collect_leaves(node.right))
         return leaves
@@ -322,7 +322,7 @@ class ExecutionEnvironment:
                 output_ids = self.model.generate(
                     input_ids, 
                     attention_mask=attention_mask,
-                    max_new_tokens=50,
+                    max_new_tokens=20,
                     pad_token_id=pad_token_id
                 )
                 return self.tokenizer.decode(output_ids[0], skip_special_tokens=True)

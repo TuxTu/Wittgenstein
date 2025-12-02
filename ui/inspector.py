@@ -20,8 +20,10 @@ class InspectResult:
         
         # Pre-compute display tokens and indices
         self._tokens = []
+        new_line = '\n'
+        tab = '\t'
         for (token_id, token_str) in token_seq:
-            display_token = token_str.replace('Ġ', ' ').replace('Ċ', '\n').replace('ĉ', '\t')
+            display_token = token_str.replace('Ġ', ' ').replace('Ċ', new_line).replace('ĉ', tab)
             self._tokens.append((display_token, token_id))
         
         # Track last render info for redrawing
