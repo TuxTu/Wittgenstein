@@ -31,7 +31,7 @@ def load_model(model_id, use_fp16=True):
     try:
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
-            dtype=dtype,
+            torch_dtype=dtype,
             device_map=device,
             trust_remote_code=True, # Needed for Qwen/custom architectures
             low_cpu_mem_usage=True  # Speeds up loading
