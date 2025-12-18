@@ -13,7 +13,7 @@ Wittgenstein provides an interactive environment for:
 
 ```bash
 # Clone the repository
-git clone 
+git clone https://github.com/TuxTu/Wittgenstein
 cd wittgenstein
 
 # Install dependencies
