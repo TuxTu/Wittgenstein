@@ -45,7 +45,9 @@ Wittgenstein operates in two modes. Press **ESC** to switch between them.
 Enter prompts to store them for later inspection and manipulation.
 
 ```
-> The capital of France is
+> The capital of Australia is
+The capital of Australia is
+·  ·       ·  ·         ·
 ```
 
 When you enter a prompt, it is:
@@ -59,7 +61,7 @@ Execute Python code in a persistent namespace with access to your prompts and th
 
 ```python
 >>> prompts[0]
-Prompt[0]('The capital of France is')
+Prompt[0]('The capital of Australia is')
 
 >>> len(prompts)
 1
@@ -181,7 +183,7 @@ Generate text continuations with optional activation patches:
 ```python
 >>> p = prompts[0]
 >>> generate(p)
-'The capital of France is Paris, which is known for...'
+'The capital of Australia is Sydney, which is known for...'
 ```
 
 If you've applied patches to the prompt, they will be applied during generation.
@@ -205,20 +207,20 @@ If you've applied patches to the prompt, they will be applied during generation.
 ```
 Enter Model ID (default: Qwen/Qwen3-0.6B): 
 [-] Loading model: Qwen/Qwen3-0.6B...
-[+] Model loaded successfully on cuda:0
+[+] Model loaded successfully on cpu
 
 Starting in COMMAND mode. Press ESC to switch modes.
 Type 'help' in COMMAND mode for available commands.
 
 >>> # Press ESC to switch to INSTRUCT mode
 
-> The Eiffel Tower is located in
-The·Ġ·Eiff·el·ĠTower·Ġis·Ġlocated·Ġin
-·   ·    ·  ·      ·   ·       ·   ·
+> The capital of Australia is
+The capital of Australia is
+·  ·       ·  ·         ·
 
-> The capital of Germany is
-The·Ġcapital·Ġof·ĠGermany·Ġis
-·   ·       ·   ·        ·
+> The capital of Austria is
+The capital of Austria is
+·  ·       ·  ·         ·
 
 >>> # Press ESC to switch back to COMMAND mode
 
@@ -228,11 +230,21 @@ The·Ġcapital·Ġof·ĠGermany·Ġis
 >>> p0 = prompts[0]
 >>> p1 = prompts[1]
 
->>> # Patch p1's last token with p0's last token activation
->>> p1[-1][10]["resid_post"] = p0[-1][10]["resid_post"]
+>>> # Before patch, despite Qwen3-0.6B gave the wrong capital of Australia
+>>> generate(p0)
+'The capital of Australia is Sydney...'
 
 >>> generate(p1)
-'The capital of Germany is Paris...'  # Patched!
+'The capital of Austria is Vienna...'
+
+>>> # Patch p1's country token with p0's country token activation
+>>> p1[3][0]["resid_post"] = p0[3][0]["resid_post"]
+
+>>> generate(p1)
+[Dependency] P1 needs -> P0:T0
+[Execute] Extracting 1 values from P0...
+[Execute] Running P1 with 1 patches...
+'The capital of Austria is the city of Darwin...'  # Patched!
 ```
 
 ---
