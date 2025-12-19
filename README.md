@@ -1,6 +1,6 @@
 # Wittgenstein(Beta)
 
-Wittgenstein(witt) is a library along with REPL-based tool for inspecting and manipulating Large Language Model (LLM) activations with prompts(tokens) as its unit.
+Wittgenstein(witt) is a token-centric library and REPL tool for inspecting and manipulating Large Language Model (LLM) activations.
 
 ## Overview
 
