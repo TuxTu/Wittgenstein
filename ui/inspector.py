@@ -14,17 +14,17 @@ class InspectResult:
     using the current terminal width.
     """
     
-    def __init__(self, prompt: str, token_seq: List[Tuple[int, str]]):
-        self.prompt = prompt
-        self.token_seq = token_seq
+    def __init__(self, prompt_text: str, tokens: List[Tuple[int, str]]):
+        self.prompt_text = prompt_text
+        self.tokens = tokens
         
         # Pre-compute display tokens and indices
         self._tokens = []
         new_line = '\n'
         tab = '\t'
-        for (token_id, token_str) in token_seq:
+        for token_id, token_str in tokens:
             display_token = token_str.replace('Ġ', ' ').replace('Ċ', new_line).replace('ĉ', tab)
-            self._tokens.append((display_token, token_id))
+            self._tokens.append((token_id, display_token))
         
         # Track last render info for redrawing
         self._last_line_count = 0
@@ -44,7 +44,7 @@ class InspectResult:
         
         # Build list of (display_token, index_str, column_width)
         tokens_with_width = []
-        for display_token, token_id in self._tokens:
+        for token_id, display_token in self._tokens:
             width = len(display_token)
             tokens_with_width.append((display_token, width))
         
@@ -55,17 +55,43 @@ class InspectResult:
         current_width = 0
         
         for display_token, width in tokens_with_width:
-            # Check if adding this token would exceed terminal width
-            if current_width + width > terminal_width and current_width > 0:
-                lines.append((current_token_line.rstrip(), current_index_line.rstrip()))
-                current_token_line = ""
-                current_index_line = ""
-                current_width = 0
-            
-            current_token_line += display_token.ljust(width)
-            current_index_line += "·".ljust(width)
-            # current_index_line += "^".ljust(width)
-            current_width += width
+            # Handle tokens with newlines - they force line breaks
+            if '\n' in display_token:
+                parts = display_token.split('\n')
+                for i, part in enumerate(parts):
+                    part_width = len(part)
+                    
+                    if i == 0:
+                        current_index_line += "·".ljust(part_width)
+
+                    if part_width > 0:
+                        # Check if adding this part would exceed terminal width
+                        if current_width + part_width > terminal_width and current_width > 0:
+                            lines.append((current_token_line.rstrip(), current_index_line.rstrip()))
+                            current_token_line = ""
+                            current_index_line = ""
+                            current_width = 0
+                        
+                        current_token_line += part
+                        current_width += part_width
+                    
+                    # After each newline character (except after the last part), start a new line
+                    if i < len(parts) - 1:
+                        lines.append((current_token_line.rstrip(), current_index_line.rstrip()))
+                        current_token_line = ""
+                        current_index_line = ""
+                        current_width = 0
+            else:
+                # Check if adding this token would exceed terminal width
+                if current_width + width > terminal_width and current_width > 0:
+                    lines.append((current_token_line.rstrip(), current_index_line.rstrip()))
+                    current_token_line = ""
+                    current_index_line = ""
+                    current_width = 0
+                
+                current_token_line += display_token.ljust(width)
+                current_index_line += "·".ljust(width)
+                current_width += width
         
         # Don't forget the last line
         if current_token_line:

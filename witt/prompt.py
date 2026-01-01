@@ -1,7 +1,7 @@
 """
 Prompt storage classes for the witt library.
 """
-from typing import Optional, List, Any, Tuple
+from typing import Optional, List, Any, Tuple, Union, Dict, overload
 
 from .state_node import StateNode
 from .computational_node import ComputationalNode, ActivationRef, ConstantNode
@@ -13,17 +13,25 @@ class Prompt:
     
     Attributes:
         text: The raw input text
-        id: Sequential index in the prompt history
+        uid: Unique internal ID based on creation order (immutable)
         tokens: The tokenized sequence
         result: Optional result from inspection
     """
     
-    def __init__(self, text: str, id: int, tokens: Optional[List[Tuple[int, str]]] = None):
+    # Class-level counter for unique IDs
+    _next_uid: int = 0
+    
+    def __init__(self, text: str, tokens: Optional[List[Tuple[int, str]]] = None):
         self.text = text
-        self.id = id
         self.tokens = tokens or []
         self.result: Any = None
-        self.head: StateNode = StateNode(self.id, None)
+        
+        # Assign unique internal ID and increment counter
+        self.uid = Prompt._next_uid
+        Prompt._next_uid += 1
+        
+        # Initialize state with uid as prompt_index
+        self.head: StateNode = StateNode(prompt_index=self.uid, parent=None)
     
     @property
     def current_state_id(self):
@@ -39,7 +47,7 @@ class Prompt:
         new_line = '\n'
         tab = '\t'
         preview = preview.replace(new_line, '\\n').replace(tab, '\\t')
-        return f"Prompt[{self.id}]({preview!r})"
+        return f"Prompt[{self.uid}]({preview!r})"
     
     def __str__(self) -> str:
         return self.text
@@ -96,7 +104,7 @@ class LayerProxy:
         return f"Token({self.token_idx}, {self.prompt.tokens[self.token_idx][1].replace('Ġ', ' ').replace('Ċ', new_line).replace('ĉ', tab)!r})"
 
     def __getitem__(self, module: str):
-        return ActivationRef(self.prompt.id, self.prompt.current_state_id, self.token_idx, self.layer_idx, module)
+        return ActivationRef(self.prompt.uid, self.prompt.current_state_id, self.token_idx, self.layer_idx, module)
 
     def __setitem__(self, module: str, value_node):
         # LHS: Check input
@@ -106,7 +114,7 @@ class LayerProxy:
 
         # Create NEW State
         new_state = StateNode(
-            prompt_index=self.prompt.id,
+            prompt_index=self.prompt.uid,
             parent=self.prompt.head,
             patch_target=(self.layer_idx, self.token_idx, module),
             patch_value_node=value_node  # Store the lazy math
@@ -117,39 +125,65 @@ class LayerProxy:
 
 
 class PromptList:
-    """A collection of prompts with filtering and lookup capabilities."""
+    """A collection of prompts with lookup by uid."""
     
     def __init__(self):
-        self._prompts: List[Prompt] = []
+        self._prompts: Dict[int, Prompt] = {}  # Keyed by uid
     
-    def add(self, text: str, tokens: Optional[List[Tuple[int, str]]] = None) -> Prompt:
-        """Add a new prompt to the list."""
-        prompt = Prompt(text, id=len(self._prompts), tokens=tokens)
-        self._prompts.append(prompt)
+    @overload
+    def add(self, prompt: Prompt) -> Prompt: ...
+    
+    @overload
+    def add(self, text: str, tokens: Optional[List[Tuple[int, str]]] = None) -> Prompt: ...
+    
+    def add(self, text_or_prompt: Union[str, Prompt], tokens: Optional[List[Tuple[int, str]]] = None) -> Prompt:
+        """
+        Add a new prompt to the collection.
+        
+        Args:
+            text_or_prompt: Either a text string or an existing Prompt object
+            tokens: Optional tokenized sequence (only used when text is provided)
+            
+        Returns:
+            The added Prompt object
+        """
+        if isinstance(text_or_prompt, Prompt):
+            prompt = text_or_prompt
+        else:
+            prompt = Prompt(text_or_prompt, tokens=tokens)
+        
+        self._prompts[prompt.uid] = prompt
         return prompt
     
-    def __getitem__(self, idx: int) -> Prompt:
-        """Access prompts by index (supports negative indexing)."""
-        return self._prompts[idx]
+    def __getitem__(self, uid: int) -> Prompt:
+        """Access prompts by uid."""
+        return self._prompts[uid]
+    
+    def __contains__(self, uid: int) -> bool:
+        """Check if a prompt with the given uid exists."""
+        return uid in self._prompts
     
     def __len__(self) -> int:
         return len(self._prompts)
     
     def __iter__(self):
-        return iter(self._prompts)
+        return iter(self._prompts.values())
     
     def __repr__(self) -> str:
         return f"PromptList({len(self._prompts)} prompts)"
     
     def filter(self, tag: Optional[str] = None) -> List[Prompt]:
         """Filter prompts by tag."""
-        result = self._prompts
+        result = list(self._prompts.values())
         if tag:
             result = [p for p in result if p.has_tag(tag)]
         return result
     
     @property
     def last(self) -> Optional[Prompt]:
-        """Get the most recent prompt."""
-        return self._prompts[-1] if self._prompts else None
+        """Get the most recently added prompt."""
+        if not self._prompts:
+            return None
+        # Dict maintains insertion order in Python 3.7+
+        return list(self._prompts.values())[-1]
 

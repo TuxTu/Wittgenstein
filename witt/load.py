@@ -2,7 +2,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-def load_model(model_id, use_fp16=True):
+def load_model(model_id, use_fp16=True, use_cpu=False):
     """
     Loads a Hugging Face model with memory optimizations for local inference.
     
@@ -18,7 +18,10 @@ def load_model(model_id, use_fp16=True):
     # Select precision
     dtype = torch.float16 if use_fp16 else torch.float32
 
-    if torch.cuda.is_available():
+    if use_cpu:
+        device = "cpu"
+        print("[!] User requested to use CPU for inference.")
+    elif torch.cuda.is_available():
         device = "cuda"
         print("[-] NVIDIA GPU detected.")
     # elif torch.backends.mps.is_available():
