@@ -24,7 +24,7 @@ text = tokenizer.apply_chat_template(
 print(text)
 
 tokens = tokenize(tokenizer, text)
-prompt = Prompt(text, tokens)
+prompt = Prompt(tokens)
 prompts.add(prompt)
 inspect.inspect(prompt)
 

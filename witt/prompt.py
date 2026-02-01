@@ -12,17 +12,16 @@ class Prompt:
     Represents a stored input prompt with metadata.
     
     Attributes:
-        text: The raw input text
+        tokens: The tokenized sequence as (token_id, token_str) tuples
+        text: (property) The raw input text, reconstructed from tokens
         uid: Unique internal ID based on creation order (immutable)
-        tokens: The tokenized sequence
         result: Optional result from inspection
     """
     
     # Class-level counter for unique IDs
     _next_uid: int = 0
     
-    def __init__(self, text: str, tokens: Optional[List[Tuple[int, str]]] = None):
-        self.text = text
+    def __init__(self, tokens: Optional[List[Tuple[int, str]]] = None):
         self.tokens = tokens or []
         self.result: Any = None
         
@@ -33,6 +32,11 @@ class Prompt:
         # Initialize state with uid as prompt_index
         self.head: StateNode = StateNode(prompt_index=self.uid, parent=None)
     
+    @property
+    def text(self) -> str:
+        """Reconstruct text from tokens by joining token strings."""
+        return ''.join(t[1] for t in self.tokens).replace('Ġ', ' ').replace('Ċ', '\n').replace('ĉ', '\t')
+
     @property
     def current_state_id(self):
         return self.head.time_step
@@ -63,10 +67,6 @@ class Prompt:
             curr = curr.parent
 
         return curr
-    
-    def has_tag(self, tag: str) -> bool:
-        """Check if prompt has a specific tag."""
-        return tag in self.tags
 
     def __getitem__(self, token_idx: int):
         if token_idx < -len(self.tokens) or token_idx >= len(self.tokens):
@@ -77,7 +77,7 @@ class Prompt:
 class TokenProxy:
     """Proxy for accessing token-level operations on a prompt."""
     
-    def __init__(self, prompt: "Prompt", index: int):
+    def __init__(self, prompt: Prompt, index: int):
         self.prompt = prompt
         self.index = index
         
@@ -93,7 +93,7 @@ class TokenProxy:
 class LayerProxy:
     """Proxy for accessing layer-level operations on a token."""
     
-    def __init__(self, prompt: "Prompt", token_idx: int, layer_idx: int):
+    def __init__(self, prompt: Prompt, token_idx: int, layer_idx: int):
         self.prompt = prompt
         self.token_idx = token_idx
         self.layer_idx = layer_idx 
@@ -134,23 +134,22 @@ class PromptList:
     def add(self, prompt: Prompt) -> Prompt: ...
     
     @overload
-    def add(self, text: str, tokens: Optional[List[Tuple[int, str]]] = None) -> Prompt: ...
+    def add(self, tokens: List[Tuple[int, str]]) -> Prompt: ...
     
-    def add(self, text_or_prompt: Union[str, Prompt], tokens: Optional[List[Tuple[int, str]]] = None) -> Prompt:
+    def add(self, tokens_or_prompt: Union[List[Tuple[int, str]], Prompt]) -> Prompt:
         """
         Add a new prompt to the collection.
         
         Args:
-            text_or_prompt: Either a text string or an existing Prompt object
-            tokens: Optional tokenized sequence (only used when text is provided)
+            tokens_or_prompt: Either a list of (token_id, token_str) tuples or an existing Prompt object
             
         Returns:
             The added Prompt object
         """
-        if isinstance(text_or_prompt, Prompt):
-            prompt = text_or_prompt
+        if isinstance(tokens_or_prompt, Prompt):
+            prompt = tokens_or_prompt
         else:
-            prompt = Prompt(text_or_prompt, tokens=tokens)
+            prompt = Prompt(tokens=tokens_or_prompt)
         
         self._prompts[prompt.uid] = prompt
         return prompt
@@ -171,13 +170,6 @@ class PromptList:
     
     def __repr__(self) -> str:
         return f"PromptList({len(self._prompts)} prompts)"
-    
-    def filter(self, tag: Optional[str] = None) -> List[Prompt]:
-        """Filter prompts by tag."""
-        result = list(self._prompts.values())
-        if tag:
-            result = [p for p in result if p.has_tag(tag)]
-        return result
     
     @property
     def last(self) -> Optional[Prompt]:

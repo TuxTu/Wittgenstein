@@ -182,7 +182,7 @@ class ExecutionEnvironment:
     def add_prompt(self, text: str) -> Prompt:
         """Store a prompt from INSTRUCT mode."""
         tokens = tokenize(self.tokenizer, text)
-        return self.prompts.add(text, tokens)
+        return self.prompts.add(tokens)
     
     def get_variable(self, name: str) -> Any:
         """Get a variable from the namespace."""
@@ -231,7 +231,6 @@ class ExecutionEnvironment:
             "Prompt Properties:",
             "  p.text     - The prompt text",
             "  p.index    - Sequential index",
-            "  p.tag(...) - Add tags to a prompt",
             "",
             "Commands:",
             "  q   - Quit",

@@ -48,8 +48,8 @@ def _ensure_node(obj: Union['ComputationalNode', int, float, torch.Tensor]) -> '
 
 class ActivationRef(ComputationalNode):
     """
-    A specific pointer to a future activation.
-    It is a leaf node that waits for the cache to be filled.
+    A specific pointer to an activation.
+    It is a leaf node that holds the activation value.
     """
     def __init__(self, prompt_id: int, state_id: int, token_idx: int, layer_idx: int, module: str):
         self.prompt_id = prompt_id
@@ -110,16 +110,17 @@ class BinaryOpNode(ComputationalNode):
 
     def evaluate(self) -> torch.Tensor:
         # This logic ONLY runs when the top-level evaluate() is triggered
+        if self._runtime_cache is not None:
+            return self._runtime_cache
+            
         val_l = self.left.evaluate()
         val_r = self.right.evaluate()
         
-        if self._runtime_cache is not None:
-            return self._runtime_cache
-        elif val_l is None or val_r is None:
+        if val_l is None or val_r is None:
             return None
-        else:
-            self._runtime_cache = self.op_func(val_l, val_r)
-            return self._runtime_cache
+        
+        self._runtime_cache = self.op_func(val_l, val_r)
+        return self._runtime_cache
         
     def __repr__(self):
         return f"({self.left} {self.op_symbol} {self.right})"
