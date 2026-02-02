@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 
 class StateNode:
@@ -17,7 +17,7 @@ class StateNode:
         self.time_step = (parent.time_step + 1) if parent else 0
 
     @property
-    def key(self) -> tuple[int, int]:
+    def key(self) -> Tuple[int, int]:
         """The unique composite key for this node."""
         return (self.prompt_index, self.time_step)
 

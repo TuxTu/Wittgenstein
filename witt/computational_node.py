@@ -60,7 +60,7 @@ class ActivationRef(ComputationalNode):
         self._runtime_cache: Optional[torch.Tensor] = None
 
     @property
-    def key(self) -> tuple[int, int]:
+    def key(self) -> Tuple[int, int]:
         """Helper to get the lookup key for the Environment."""
         return (self.prompt_id, self.state_id)
 

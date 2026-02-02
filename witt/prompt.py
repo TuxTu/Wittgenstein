@@ -73,6 +73,8 @@ class Prompt:
             raise IndexError(f"Token index {token_idx} out of range [-{len(self.tokens)}, {len(self.tokens)})")
         return TokenProxy(self, token_idx % len(self.tokens))
 
+    def append(self, new_tokens: List[Tuple[int, str]]):
+        self.tokens.extend(new_tokens)
 
 class TokenProxy:
     """Proxy for accessing token-level operations on a prompt."""

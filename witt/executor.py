@@ -248,6 +248,8 @@ class Executor:
                     attention_mask=attention_mask,
                     pad_token_id=pad_token_id
                 )
+                print(self.tokenizer.decode(output_ids[0][prompt_len:], skip_special_tokens=False)
+)
                 return self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
             else:
                 # Forward pass only (for extraction)
@@ -259,7 +261,7 @@ class Executor:
             for h in hook_handles:
                 h.remove()
     
-    def generate(self, prompt, max_new_tokens: int = 1024) -> str:
+    def generate(self, prompt, max_new_tokens: int = 35536) -> str:
         """
         Generate text for a prompt, applying any patches in its history.
         
