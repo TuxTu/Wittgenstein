@@ -2,9 +2,48 @@
 Prompt storage classes for the witt library.
 """
 from typing import Optional, List, Any, Tuple, Union, Dict, overload
+import functools
 
 from .state_node import StateNode
 from .computational_node import ComputationalNode, ActivationRef, ConstantNode
+
+
+@functools.lru_cache(maxsize=1)
+def _get_byte_decoder() -> Dict[str, int]:
+    """
+    Build the reverse mapping from GPT-2 BPE unicode characters to bytes.
+    This is the inverse of the byte_encoder used in GPT-2/BPE tokenizers.
+    """
+    # Characters that map to themselves (printable ASCII + some Latin-1)
+    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
+    cs = bs[:]
+    
+    # Other bytes map to characters starting at U+0100
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    
+    # Return unicode char -> byte mapping
+    return {chr(c): b for b, c in zip(bs, cs)}
+
+
+def decode_bpe_token(token_str: str) -> str:
+    """
+    Decode a BPE token string to its actual text representation.
+    Handles all GPT-2 style byte-level encodings (Ġ for space, Ċ for newline, 
+    em-dashes, curly quotes, etc.)
+    """
+    byte_decoder = _get_byte_decoder()
+    try:
+        # Convert each character to its byte value, then decode as UTF-8
+        byte_values = bytes([byte_decoder.get(c, ord(c)) for c in token_str])
+        return byte_values.decode('utf-8', errors='replace')
+    except Exception:
+        # Fallback: return as-is if decoding fails
+        return token_str
 
 
 class Prompt:
@@ -35,7 +74,7 @@ class Prompt:
     @property
     def text(self) -> str:
         """Reconstruct text from tokens by joining token strings."""
-        return ''.join(t[1] for t in self.tokens).replace('Ġ', ' ').replace('Ċ', '\n').replace('ĉ', '\t')
+        return ''.join(decode_bpe_token(t[1]) for t in self.tokens)
 
     @property
     def current_state_id(self):
@@ -84,9 +123,8 @@ class TokenProxy:
         self.index = index
         
     def __repr__(self) -> str:
-        new_line = '\n'
-        tab = '\t'
-        return f"Token({self.index}, {self.prompt.tokens[self.index][1].replace('Ġ', ' ').replace('Ċ', new_line).replace('ĉ', tab)!r})"
+        decoded = decode_bpe_token(self.prompt.tokens[self.index][1])
+        return f"Token({self.index}, {decoded!r})"
 
     def __getitem__(self, layer_idx: int):
         return LayerProxy(self.prompt, self.index, layer_idx)
@@ -101,9 +139,8 @@ class LayerProxy:
         self.layer_idx = layer_idx 
         
     def __repr__(self) -> str:
-        new_line = '\n'
-        tab = '\t'
-        return f"Token({self.token_idx}, {self.prompt.tokens[self.token_idx][1].replace('Ġ', ' ').replace('Ċ', new_line).replace('ĉ', tab)!r})"
+        decoded = decode_bpe_token(self.prompt.tokens[self.token_idx][1])
+        return f"Layer({self.layer_idx}, Token({self.token_idx}, {decoded!r}))"
 
     def __getitem__(self, module: str):
         return ActivationRef(self.prompt.uid, self.prompt.current_state_id, self.token_idx, self.layer_idx, module)
