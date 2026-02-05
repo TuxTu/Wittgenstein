@@ -199,32 +199,3 @@ class Chat(Prompt):
     def prompt_getitem(self, token_idx: int) -> TokenProxy:
         """Call parent Prompt's __getitem__ for token access."""
         return super().__getitem__(token_idx)
-
-    def extract_message(self, content: str, tokens: List[str]) -> Tuple[int, int]:
-        """
-        Find the start and end token indices that contain the given message content.
-        
-        Uses full BPE byte decoding to properly handle all special characters
-        (em-dashes, curly quotes, etc.)
-        """
-        if not tokens or not content:
-            return (-1, -1)
-        
-        char_to_token = []
-        reconstructed = ""
-        
-        for token_idx, token_str in enumerate(tokens):
-            decoded = decode_bpe_token(token_str)
-            for _ in decoded:
-                char_to_token.append(token_idx)
-            reconstructed += decoded
-        
-        pos = reconstructed.find(content)
-        if pos == -1:
-            return (-1, -1)
-        
-        # Map character positions to token indices
-        start_idx = char_to_token[pos]
-        end_idx = char_to_token[pos + len(content) - 1]
-        
-        return (start_idx, end_idx)

@@ -1,5 +1,6 @@
 import witt
 import ui
+import json
 
 model_id = "Qwen/Qwen3-0.6B"
 
@@ -15,6 +16,7 @@ messages = [
     {"role": "user", "content": "Ok, let's get started.\nTrial 1: Do you detect an injected thought? If so, what is the injected thought about"},
 ]
 
+print(json.dumps(tokenizer.special_tokens_map, indent=2))
 # messages = [
     # {"role": "system", "content": ""},
     # {"role": "user", "content": ""},
@@ -29,9 +31,18 @@ text = tokenizer.apply_chat_template(
 
 tokens = witt.tokenize(tokenizer, text)
 chat = witt.Chat(messages, tokens)
-inspect.inspect(chat)
-prompts.add(chat)
 
-executor = witt.Executor(model, tokenizer, prompts)
+print(chat.find_content_index("Ok, let's get started."))
+print(chat[124])
+print(chat[125])
+print(chat[126])
+print(chat[127])
+print(chat[128])
+print(chat[129])
+print(chat[130])
+# inspect.inspect(chat)
+# prompts.add(chat)
 
-print(executor.generate(chat, max_new_tokens=256))
+# executor = witt.Executor(model, tokenizer, prompts)
+# 
+# print(executor.generate(chat, max_new_tokens=256))
