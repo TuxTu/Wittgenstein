@@ -1,11 +1,11 @@
-# 📝 Project To-Do List
+# Project To-Do List
 
-## 🚀 Active Tasks
+## Active Tasks
 - [ ] **Next Token Generation**: Implement `next_token_generation` with support for runtime hooks.
 - [ ] **Prompt Selector**: Implement a Selector for the `Prompt` class.
 
-## 📥 Backlog
+## Backlog
 <!-- Add new items here -->
 
-## ✅ Completed
+## Completed
 <!-- Move completed items here -->

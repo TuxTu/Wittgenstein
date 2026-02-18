@@ -6,6 +6,7 @@ import functools
 
 from .state_node import StateNode
 from .computational_node import ComputationalNode, ActivationRef, ConstantNode
+from .selector import Selector
 
 
 @functools.lru_cache(maxsize=1)
@@ -112,10 +113,30 @@ class Prompt:
 
         return curr
 
-    def __getitem__(self, token_idx: int):
-        if token_idx < -len(self.tokens) or token_idx >= len(self.tokens):
-            raise IndexError(f"Token index {token_idx} out of range [-{len(self.tokens)}, {len(self.tokens)})")
-        return TokenProxy(self, token_idx % len(self.tokens))
+    def __getitem__(self, key: Union[int, slice, list]):
+        """
+        Access tokens by index, slice, or list of indices.
+        
+        - prompt[3]     -> TokenProxy with IndexSelector
+        - prompt[3:7]   -> TokenProxy with SliceSelector
+        - prompt[[0,2]] -> TokenProxy with ListSelector
+        """
+        sel = Selector.from_key(key)
+        n = len(self.tokens)
+        # Bounds-check for single index
+        if sel.is_single:
+            idx = key if isinstance(key, int) else key
+            if idx < -n or idx >= n:
+                raise IndexError(
+                    f"Token index {idx} out of range [-{n}, {n})"
+                )
+        # Resolve open-ended slices against the known token count so that
+        # downstream (ActivationRef) always gets a concrete count.
+        if isinstance(key, slice):
+            from .selector import SliceSelector
+            concrete = slice(*key.indices(n))
+            sel = SliceSelector(concrete)
+        return TokenProxy(self, sel)
 
     def append(self, new_tokens: List[Tuple[int, str]]):
         self.tokens.extend(new_tokens)
@@ -153,47 +174,73 @@ class Prompt:
         return (start_idx, end_idx) 
 
 class TokenProxy:
-    """Proxy for accessing token-level operations on a prompt."""
+    """
+    Proxy for accessing token-level operations on a prompt.
     
-    def __init__(self, prompt: Prompt, index: int):
+    Stores a Selector for the token dimension.  The next ``__getitem__``
+    call selects layers and produces a ``LayerProxy``.
+    """
+    
+    def __init__(self, prompt: Prompt, token_selector: Selector):
         self.prompt = prompt
-        self.index = index
+        self.token_selector = token_selector
         
     def __repr__(self) -> str:
-        decoded = decode_bpe_token(self.prompt.tokens[self.index][1])
-        return f"Token({self.index}, {decoded!r})"
+        if self.token_selector.is_single:
+            idx = self.token_selector._index
+            decoded = decode_bpe_token(self.prompt.tokens[idx][1])
+            return f"Token({idx}, {decoded!r})"
+        return f"Token({self.token_selector})"
 
-    def __getitem__(self, layer_idx: int):
-        return LayerProxy(self.prompt, self.index, layer_idx)
+    def __getitem__(self, key: Union[int, slice, list]):
+        """
+        Select layer(s).
+        
+        - prompt[3][5]     -> LayerProxy with IndexSelector
+        - prompt[3][2:5]   -> LayerProxy with SliceSelector
+        - prompt[3][[1,3]] -> LayerProxy with ListSelector
+        """
+        layer_sel = Selector.from_key(key)
+        return LayerProxy(self.prompt, self.token_selector, layer_sel)
 
 
 class LayerProxy:
-    """Proxy for accessing layer-level operations on a token."""
+    """
+    Proxy for accessing layer-level operations on token(s).
     
-    def __init__(self, prompt: Prompt, token_idx: int, layer_idx: int):
+    Stores Selectors for both token and layer dimensions.  The next
+    ``__getitem__`` selects a module name and produces an ``ActivationRef``.
+    """
+    
+    def __init__(self, prompt: Prompt, token_selector: Selector, layer_selector: Selector):
         self.prompt = prompt
-        self.token_idx = token_idx
-        self.layer_idx = layer_idx 
+        self.token_selector = token_selector
+        self.layer_selector = layer_selector
         
     def __repr__(self) -> str:
-        decoded = decode_bpe_token(self.prompt.tokens[self.token_idx][1])
-        return f"Layer({self.layer_idx}, Token({self.token_idx}, {decoded!r}))"
+        return f"Layer({self.layer_selector}, Token({self.token_selector}))"
 
     def __getitem__(self, module: str):
-        return ActivationRef(self.prompt.uid, self.prompt.current_state_id, self.token_idx, self.layer_idx, module)
+        return ActivationRef(
+            self.prompt.uid,
+            self.prompt.current_state_id,
+            self.token_selector,
+            self.layer_selector,
+            module,
+        )
 
     def __setitem__(self, module: str, value_node):
         # LHS: Check input
         if not isinstance(value_node, ComputationalNode):
-            # Allow implicit conversion of constants: p[0] = 5.0
-            value_node = ConstantNode(value_node) 
+            # Allow implicit conversion of constants: p[0][5]["resid_post"] = 5.0
+            value_node = ConstantNode(value_node)
 
-        # Create NEW State
+        # Create NEW State with selector-aware patch_target
         new_state = StateNode(
             prompt_index=self.prompt.uid,
             parent=self.prompt.head,
-            patch_target=(self.layer_idx, self.token_idx, module),
-            patch_value_node=value_node  # Store the lazy math
+            patch_target=(self.layer_selector, self.token_selector, module),
+            patch_value_node=value_node,
         )
         
         # Advance the pointer

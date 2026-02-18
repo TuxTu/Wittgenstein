@@ -6,13 +6,16 @@ This module provides the Executor class which handles:
 - Applying activation patches (interventions)
 - Extracting activation values from specific locations
 - Resolving dependencies between computational nodes
+
+Supports Selector-based token and layer addressing for both
+extraction and injection.
 """
 import torch
 from typing import List, Optional, Callable
 from collections import defaultdict
 
 from .state_node import StateNode
-from .computational_node import ComputationalNode, ActivationRef, BinaryOpNode
+from .computational_node import ComputationalNode, ActivationRef
 
 
 class Executor:
@@ -34,11 +37,26 @@ class Executor:
         self.model = model
         self.tokenizer = tokenizer
         self.prompts = prompts
+
+    @property
+    def num_layers(self) -> int:
+        """Return the number of transformer layers in the model."""
+        base_model = getattr(self.model, "model", None) or getattr(self.model, "transformer", None)
+        if not base_model:
+            base_model = self.model
+        layers = getattr(base_model, "layers", None) or getattr(base_model, "h", None)
+        if not layers:
+            raise ValueError(f"Could not locate layers in model {type(self.model)}")
+        return len(layers)
     
     @staticmethod
     def collect_leaves(node: ComputationalNode) -> List[ActivationRef]:
         """
         Recursively collect all unfilled ActivationRef leaves from a computational graph.
+        
+        Uses the generic ``children()`` interface so it works with all node types
+        (BinaryOpNode, TorchFunctionNode, MethodCallNode, etc.) without
+        type-specific checks.
         
         Args:
             node: The root of the computational graph to traverse
@@ -46,12 +64,11 @@ class Executor:
         Returns:
             List of ActivationRef nodes that haven't been evaluated yet
         """
-        leaves = []
         if isinstance(node, ActivationRef) and node.evaluate() is None:
-            leaves.append(node)
-        elif isinstance(node, BinaryOpNode) and node.evaluate() is None:
-            leaves.extend(Executor.collect_leaves(node.left))
-            leaves.extend(Executor.collect_leaves(node.right))
+            return [node]
+        leaves = []
+        for child in node.children():
+            leaves.extend(Executor.collect_leaves(child))
         return leaves
     
     def get_transformer_module(self, layer_idx: int, module_name: str):
@@ -131,7 +148,7 @@ class Executor:
     def execute_pass(
         self, 
         state: StateNode, 
-        max_new_tokens,
+        max_new_tokens=None,
         mode: str = "inference", 
         extraction_targets: Optional[List[ActivationRef]] = None
     ) -> Optional[str]:
@@ -140,6 +157,7 @@ class Executor:
         
         Args:
             state: The StateNode representing the current prompt state
+            max_new_tokens: Maximum tokens to generate (inference mode)
             mode: Either "inference" (generate output) or "extraction" (extract activations)
             extraction_targets: List of ActivationRef nodes to fill (for extraction mode)
             
@@ -168,6 +186,7 @@ class Executor:
         input_ids = torch.tensor(token_ids_list, device=self.model.device).unsqueeze(0)
         attention_mask = torch.ones_like(input_ids)
         prompt_len = input_ids.shape[1]
+        n_layers = self.num_layers
 
         # Define the Unified Hook Factory
         def create_hook(layer_idx: int, module_name: str, is_pre: bool = False) -> Callable:
@@ -181,24 +200,42 @@ class Executor:
                 # Check if we are in the "Prefill" phase (processing the prompt)
                 is_prefill = (tensor.shape[1] == prompt_len)
                 
+                seq_len = tensor.shape[1]
+
                 # A. Apply Injections (patches)
                 if is_prefill:
                     for patch_node in history_patches:
-                        t_layer, t_token, t_mod = patch_node.patch_target
-                        if t_layer == layer_idx and t_mod == module_name:
-                            if t_token < tensor.shape[1]:
-                                val = patch_node.patch_value_node.evaluate()
-                                val = val.to(tensor.device).to(tensor.dtype)
-                                tensor[:, t_token, :] = val
+                        p_layer_sel, p_token_sel, p_mod = patch_node.patch_target
+                        if p_mod != module_name:
+                            continue
+                        # Check if this layer is in the patch's layer selector
+                        patch_layer_indices = p_layer_sel.indices(n_layers)
+                        if layer_idx not in patch_layer_indices:
+                            continue
+                        # Resolve token selector
+                        tok_idx = p_token_sel.resolve(seq_len)
+                        val = patch_node.patch_value_node.evaluate()
+                        if val is not None:
+                            val = val.to(tensor.device).to(tensor.dtype)
+                            tensor[:, tok_idx, :] = val
                 
                 # B. Apply Extractions
                 if mode == "extraction" and extraction_targets:
                     if is_prefill:
                         for ref in extraction_targets:
-                            if ref.layer_idx == layer_idx and ref.module == module_name:
-                                if ref.token_idx < tensor.shape[1]:
-                                    data = tensor[:, ref.token_idx, :].clone().detach()
-                                    ref.set_cache(data)
+                            if ref.module != module_name:
+                                continue
+                            # Check if this layer is in the ref's layer selector
+                            ref_layer_indices = ref.layer_selector.indices(n_layers)
+                            if layer_idx not in ref_layer_indices:
+                                continue
+                            # Resolve token selector and extract
+                            tok_idx = ref.token_selector.resolve(seq_len)
+                            data = tensor[:, tok_idx, :].clone().detach()
+                            if ref.layer_selector.is_single:
+                                ref.set_cache(data)
+                            else:
+                                ref.set_layer_cache(layer_idx, data)
                 
                 # Return modified tensors
                 if is_pre:
@@ -214,15 +251,17 @@ class Executor:
         hook_handles = []
         needed_hooks = set()
         
-        # Collect locations from patches
+        # Collect locations from patches (now with selectors)
         for p in history_patches:
-            t_layer, _, t_mod = p.patch_target
-            needed_hooks.add((t_layer, t_mod))
+            p_layer_sel, _, p_mod = p.patch_target
+            for li in p_layer_sel.indices(n_layers):
+                needed_hooks.add((li, p_mod))
             
-        # Collect locations from extractions
+        # Collect locations from extractions (now with selectors)
         if mode == "extraction" and extraction_targets:
             for ref in extraction_targets:
-                needed_hooks.add((ref.layer_idx, ref.module))
+                for li in ref.layer_selector.indices(n_layers):
+                    needed_hooks.add((li, ref.module))
                 
         # Attach hooks
         for layer_idx, module_name in needed_hooks:
@@ -248,8 +287,7 @@ class Executor:
                     attention_mask=attention_mask,
                     pad_token_id=pad_token_id
                 )
-                print(self.tokenizer.decode(output_ids[0][prompt_len:], skip_special_tokens=False)
-)
+                print(self.tokenizer.decode(output_ids[0][prompt_len:], skip_special_tokens=False))
                 return self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
             else:
                 # Forward pass only (for extraction)
@@ -272,4 +310,3 @@ class Executor:
             The generated text
         """
         return self.execute_pass(prompt.head, mode="inference", max_new_tokens=max_new_tokens)
-

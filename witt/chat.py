@@ -3,6 +3,7 @@ from typing_extensions import TypedDict, NotRequired
 from enum import Enum
 
 from .prompt import Prompt, TokenProxy, decode_bpe_token
+from .selector import Selector
 
 
 class ChatMessage(TypedDict):
@@ -21,18 +22,45 @@ class ContentProxy:
         self.length = end_idx - start_idx
         self.field = field  # "content" or "reasoning_content"
     
-    def __getitem__(self, relative_token_idx: int) -> TokenProxy:
-        """Access a token by relative index within this content span."""
-        # Handle negative indices
-        if relative_token_idx < 0:
-            relative_token_idx = self.length + relative_token_idx
+    def __getitem__(self, key: Union[int, slice, list]) -> TokenProxy:
+        """
+        Access token(s) by relative index/slice/list within this content span.
         
-        if relative_token_idx < 0 or relative_token_idx >= self.length:
-            raise IndexError(f"Token index {relative_token_idx} out of range [0, {self.length})")
-        
-        # Translate to global token index
-        global_token_idx = self.start_idx + relative_token_idx
-        return self.chat.prompt_getitem(global_token_idx)
+        The relative key is translated to global token indices before
+        creating a TokenProxy with an appropriate Selector.
+        """
+        if isinstance(key, int):
+            # Single index – translate to global
+            idx = key
+            if idx < 0:
+                idx = self.length + idx
+            if idx < 0 or idx >= self.length:
+                raise IndexError(
+                    f"Token index {key} out of range [0, {self.length})"
+                )
+            global_idx = self.start_idx + idx
+            return self.chat.prompt_getitem(global_idx)
+        elif isinstance(key, slice):
+            # Translate relative slice to global slice
+            start, stop, step = key.indices(self.length)
+            global_slice = slice(self.start_idx + start, self.start_idx + stop, step)
+            sel = Selector.from_key(global_slice)
+            return TokenProxy(self.chat, sel)
+        elif isinstance(key, (list, tuple)):
+            # Translate relative list to global list
+            global_indices = []
+            for idx in key:
+                if idx < 0:
+                    idx = self.length + idx
+                if idx < 0 or idx >= self.length:
+                    raise IndexError(
+                        f"Token index {idx} out of range [0, {self.length})"
+                    )
+                global_indices.append(self.start_idx + idx)
+            sel = Selector.from_key(global_indices)
+            return TokenProxy(self.chat, sel)
+        else:
+            raise TypeError(f"Invalid key type: {type(key)}")
     
     def __len__(self) -> int:
         return self.length
@@ -178,24 +206,25 @@ class Chat(Prompt):
         
         super().append(new_tokens)
 
-    def __getitem__(self, key: Union[str, int]) -> Union[RoleProxy, TokenProxy]:
+    def __getitem__(self, key: Union[str, int, slice, list]) -> Union[RoleProxy, TokenProxy]:
         """
-        Access by role name or token index.
+        Access by role name, token index, slice, or list.
         
-        - chat["user"] → RoleProxy for user messages
-        - chat[5] → TokenProxy for token at index 5 (same as Prompt behavior)
+        - chat["user"]  -> RoleProxy for user messages
+        - chat[5]       -> TokenProxy (single token)
+        - chat[3:7]     -> TokenProxy (token range)
+        - chat[[0,2,4]] -> TokenProxy (token list)
         """
         if isinstance(key, str):
             # Access by role name
             if key not in [r.value for r in self.RoleType]:
                 raise KeyError(f"Unknown role: {key}")
             return RoleProxy(self, key)
-        elif isinstance(key, int):
-            # Fall back to Prompt's token indexing
+        elif isinstance(key, (int, slice, list)):
             return self.prompt_getitem(key)
         else:
             raise TypeError(f"Invalid key type: {type(key)}")
 
-    def prompt_getitem(self, token_idx: int) -> TokenProxy:
+    def prompt_getitem(self, key: Union[int, slice, list]) -> TokenProxy:
         """Call parent Prompt's __getitem__ for token access."""
-        return super().__getitem__(token_idx)
+        return super().__getitem__(key)
