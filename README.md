@@ -126,7 +126,7 @@ This displays the tokenization with visual markers showing token boundaries.
 
 Wittgenstein's core feature is the ability to patch activations during model inference.
 
-### Accessing Activations
+### Activation addressing
 
 Use bracket notation to reference specific activations:
 
@@ -134,35 +134,47 @@ Use bracket notation to reference specific activations:
 p[token_idx][layer_idx][module]
 ```
 
-- `token_idx` — Token position (0-indexed, supports negative indexing)
-- `layer_idx` — Layer number
+- `token_idx` — Token position (int, slice, or list; supports negative indexing)
+- `layer_idx` — Layer number (int, slice, or list)
 - `module` — One of: `"resid_pre"`, `"resid_post"`, `"mlp"`, `"attn"`
 
-### Example: Reading an Activation Reference
+### Identity-preserving activation references
+
+Every `Prompt` maintains a node registry. Reading the same coordinate always
+returns the **identical** `ActivationRef` object — no duplicates are created:
+
+```python
+>>> ref1 = p[0][5]["resid_post"]
+>>> ref2 = p[0][5]["resid_post"]
+>>> ref1 is ref2
+True
+```
+
+### Example: Reading an activation reference
 
 ```python
 >>> p = prompts[0]
 >>> p[0][5]["resid_post"]
-Ref(P0.S0.T0.L5.resid_post)
+Ref(P0.TIndexSelector(0).LIndexSelector(5).resid_post[deps=0])
 ```
 
-This creates a lazy reference that will be resolved when needed.
+The `deps=N` suffix shows how many causal writes were captured in the
+dependency snapshot at instantiation time (see below).
 
-### Example: Patching an Activation
+### Example: Patching an activation
 
 ```python
 >>> p = prompts[0]
 >>> q = prompts[1]
 
-# Set token 3, layer 5, resid_post of prompt p
-# to the value from token 2, layer 5, resid_post of prompt q
+# Patch p's token-3 / layer-5 / resid_post with the activation from q
 >>> p[3][5]["resid_post"] = q[2][5]["resid_post"]
 
-# Generate with the patched activation
+# Generate with the patch applied
 >>> generate(p)
 ```
 
-### Arithmetic on Activations
+### Arithmetic on activations
 
 You can perform arithmetic operations on activation references:
 
@@ -172,7 +184,35 @@ You can perform arithmetic operations on activation references:
 >>> p[0][5]["resid_post"] = (q[0][5]["resid_post"] - r[0][5]["resid_post"]) * 0.5
 ```
 
-Supported operations: `+`, `-`, `*`, `/`
+Supported operations: `+`, `-`, `*`, `/`, `**`, `@` and all other PyTorch
+tensor operations.
+
+### Modification ledger and dependency snapshots
+
+**Writes** (`p[tok][layer][module] = value`) are recorded in `p`'s
+modification ledger.  They become active patches during the next forward
+pass.  The latest write to a given position supersedes earlier ones.
+
+**Reads** (`p[tok][layer][module]`) instantiate an `ActivationRef` whose
+**dependency snapshot** is frozen at creation time.  The snapshot contains
+exactly the writes in the source prompt's ledger that causally affect the
+target position according to the *triangle rule*:
+
+> A write at `(write_token, write_layer)` causally affects a target at
+> `(target_token, target_layer)` iff
+> `target_token >= write_token` AND `target_layer >= write_layer`.
+
+This means that if you modify a prompt *after* extracting a reference from
+it, the already-created reference retains its original snapshot and is
+unaffected by the subsequent write:
+
+```python
+>>> q[1][3]["resid_post"] = original_value
+>>> ref = q[2][5]["resid_post"]   # snapshot captures original_value
+>>> q[1][3]["resid_post"] = new_value   # too late — ref already frozen
+>>> p[3][5]["resid_post"] = ref
+>>> generate(p)   # uses original_value for q's activation, not new_value
+```
 
 ---
 
@@ -256,8 +296,8 @@ The capital of Austria is
 | Module | Contents |
 |--------|----------|
 | `witt.prompt` | `Prompt`, `PromptList`, `TokenProxy`, `LayerProxy` |
-| `witt.computational_node` | `ComputationalNode`, `ActivationRef`, `BinaryOpNode`, `ConstantNode` |
-| `witt.state_node` | `StateNode` — Intervention tree tracking |
+| `witt.computational_node` | `ComputationalNode`, `ActivationRef`, `ConstantNode`, `WriteRecord` |
+| `witt.state_node` | `StateNode` — Retained for compatibility |
 | `witt.load` | `load_model()`, `load_tokenizer()` |
 | `witt.tokenize` | `tokenize()` |
 

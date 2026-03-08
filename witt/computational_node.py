@@ -7,6 +7,8 @@ node and replayed at evaluation time. Operations are validated at definition tim
 via meta tensor dry-runs.
 """
 import torch
+import operator as pyop
+from dataclasses import dataclass
 from typing import ClassVar, Dict, List, Union, Tuple, Optional
 
 from .selector import Selector
@@ -25,11 +27,6 @@ def _to_meta(obj):
     return obj
 
 
-def _ensure_node(obj: Union['ComputationalNode', int, float, torch.Tensor]) -> 'ComputationalNode':
-    """Wrap scalars/tensors into ConstantNode so arithmetic works uniformly."""
-    if isinstance(obj, ComputationalNode):
-        return obj
-    return ConstantNode(obj)
 
 
 def _resolve_args(args: tuple) -> tuple:
@@ -52,11 +49,146 @@ def _resolve_key(key):
     return key
 
 
+def _build_operator_mappings():
+    """Automatically build operator mappings by scanning operator module."""
+    import operator as pyop
+
+    # Auto-discover operator functions from operator module
+    # Pattern: most map operator.func → __func__ dunder
+    # Special cases handled in overrides
+    dunder_to_op = {}
+    op_to_torch = {}
+    unary_ops = set()
+
+    # Known unary operators in operator module
+    UNARY_OPERATOR_NAMES = {'neg', 'pos', 'abs', 'invert'}
+
+    # Discover all callable attributes in operator module
+    for name in dir(pyop):
+        if name.startswith('_'):  # Skip private attributes
+            continue
+
+        op_func = getattr(pyop, name)
+        if not callable(op_func):
+            continue
+
+        # Convert operator function name to dunder name
+        # Handle special cases
+        if name == 'and_':
+            dunder = '__and__'
+            torch_name = 'bitwise_and'
+        elif name == 'or_':
+            dunder = '__or__'
+            torch_name = 'bitwise_or'
+        elif name == 'xor':
+            dunder = '__xor__'
+            torch_name = 'bitwise_xor'
+        elif name == 'invert':
+            dunder = '__invert__'
+            torch_name = 'bitwise_not'
+        elif name == 'truediv':
+            dunder = '__truediv__'
+            torch_name = 'true_divide'
+        elif name == 'floordiv':
+            dunder = '__floordiv__'
+            torch_name = 'floor_divide'
+        elif name == 'mod':
+            dunder = '__mod__'
+            torch_name = 'remainder'
+        elif name == 'pos':
+            dunder = '__pos__'
+            torch_name = 'positive'  # may not exist
+        else:
+            # Default pattern: operator.add → __add__
+            dunder = f'__{name}__'
+            torch_name = name
+
+        # Get torch function (handle missing functions gracefully)
+        torch_func = getattr(torch, torch_name, None)
+        if torch_func is None:
+            if name == 'pos':
+                torch_func = lambda x: x  # identity function
+            else:
+                continue  # Skip if torch doesn't have this operator
+
+        dunder_to_op[dunder] = op_func
+        op_to_torch[op_func] = torch_func
+
+        # Track unary operators
+        if name in UNARY_OPERATOR_NAMES:
+            unary_ops.add(dunder)
+
+    return dunder_to_op, op_to_torch, unary_ops
+
+
+# ---------------------------------------------------------------------------
+# Metaclass for operator support
+# ---------------------------------------------------------------------------
+
+class OperatorMeta(type):
+    """
+    Metaclass that automatically adds Python operator support to ComputationalNode.
+    All operators delegate to torch functions, which then trigger __torch_function__
+    to create TorchFunctionNode instances.
+    """
+
+    # Build mappings once using module-level function
+    _DUNDER_TO_OP, _OP_TO_TORCH, _UNARY_OPS = _build_operator_mappings()
+
+    @classmethod
+    def _make_forward_method(cls, torch_func, is_unary=False):
+        """Create a forward operator method that delegates to torch function."""
+        if is_unary:
+            def method(self):
+                return torch_func(self)  # Triggers __torch_function__
+        else:
+            def method(self, other):
+                return torch_func(self, other)  # Triggers __torch_function__
+        return method
+
+    @classmethod
+    def _make_reverse_method(cls, torch_func):
+        """Create a reverse operator method (e.g., __radd__)."""
+        def method(self, other):
+            # Swap arguments: torch_func(other, self)
+            return torch_func(other, self)  # Triggers __torch_function__
+        return method
+
+    def __new__(cls, name, bases, namespace):
+        # Add forward operators
+        for dunder, pyop_func in cls._DUNDER_TO_OP.items():
+            if pyop_func not in cls._OP_TO_TORCH:
+                continue
+            torch_func = cls._OP_TO_TORCH[pyop_func]
+            is_unary = dunder in cls._UNARY_OPS
+            namespace[dunder] = cls._make_forward_method(torch_func, is_unary)
+
+        # Add reverse operators (for binary operators only)
+        reverse_map = {}
+        for dunder in cls._DUNDER_TO_OP:
+            if dunder in cls._UNARY_OPS:
+                continue  # Skip unary operators
+            # Convert __add__ to __radd__, __sub__ to __rsub__, etc.
+            # Pattern: __{op}__ -> __r{op}__
+            op_name = dunder[2:-2]  # Remove '__' prefix and suffix
+            rev_dunder = f'__r{op_name}__'
+            reverse_map[rev_dunder] = dunder
+
+        for rev_dunder, fwd_dunder in reverse_map.items():
+            if fwd_dunder in cls._DUNDER_TO_OP:
+                pyop_func = cls._DUNDER_TO_OP[fwd_dunder]
+                if pyop_func in cls._OP_TO_TORCH:
+                    torch_func = cls._OP_TO_TORCH[pyop_func]
+                    namespace[rev_dunder] = cls._make_reverse_method(torch_func)
+
+        return super().__new__(cls, name, bases, namespace)
+
+
 # ---------------------------------------------------------------------------
 # Base class
 # ---------------------------------------------------------------------------
 
-class ComputationalNode:
+class ComputationalNode(metaclass=OperatorMeta):
     """
     Base class for every node in the lazy computation graph.
 
@@ -64,7 +196,7 @@ class ComputationalNode:
       - __torch_function__  : catches torch.xxx(node, ...)
       - __getattr__         : catches node.method(...) and node.attr
       - __getitem__         : catches node[key]
-    Arithmetic dunders are kept explicit for nicer __repr__.
+    Arithmetic dunders are automatically generated via OperatorMeta metaclass.
 
     Every node carries a ``_meta`` tensor (device='meta', zero memory) that
     tracks the output shape.  When a new node is created the same operation
@@ -138,59 +270,26 @@ class ComputationalNode:
             node._meta = None
         return node
 
-    # ------------------------------------------------------------------
-    # Explicit arithmetic dunders  (nicer __repr__ than generic recording)
-    # ------------------------------------------------------------------
 
-    def __add__(self, other):
-        node = BinaryOpNode(self, _ensure_node(other), torch.add, "+")
-        node._meta = torch.add(_to_meta(self), _to_meta(other))
-        return node
 
-    def __sub__(self, other):
-        node = BinaryOpNode(self, _ensure_node(other), torch.sub, "-")
-        node._meta = torch.sub(_to_meta(self), _to_meta(other))
-        return node
+# ---------------------------------------------------------------------------
+# Write record (used by Prompt ledger and ActivationRef snapshots)
+# ---------------------------------------------------------------------------
 
-    def __mul__(self, other):
-        node = BinaryOpNode(self, _ensure_node(other), torch.mul, "*")
-        node._meta = torch.mul(_to_meta(self), _to_meta(other))
-        return node
+@dataclass
+class WriteRecord:
+    """
+    A single activation write recorded in a Prompt's modification ledger.
 
-    def __truediv__(self, other):
-        node = BinaryOpNode(self, _ensure_node(other), torch.div, "/")
-        node._meta = torch.div(_to_meta(self), _to_meta(other))
-        return node
-
-    def __radd__(self, other):
-        node = BinaryOpNode(_ensure_node(other), self, torch.add, "+")
-        node._meta = torch.add(_to_meta(other), _to_meta(self))
-        return node
-
-    def __rsub__(self, other):
-        node = BinaryOpNode(_ensure_node(other), self, torch.sub, "-")
-        node._meta = torch.sub(_to_meta(other), _to_meta(self))
-        return node
-
-    def __rmul__(self, other):
-        node = BinaryOpNode(_ensure_node(other), self, torch.mul, "*")
-        node._meta = torch.mul(_to_meta(other), _to_meta(self))
-        return node
-
-    def __rtruediv__(self, other):
-        node = BinaryOpNode(_ensure_node(other), self, torch.div, "/")
-        node._meta = torch.div(_to_meta(other), _to_meta(self))
-        return node
-
-    def __neg__(self):
-        node = UnaryOpNode(self, torch.neg, "-")
-        node._meta = torch.neg(self._meta)
-        return node
-
-    def __abs__(self):
-        node = UnaryOpNode(self, torch.abs, "abs")
-        node._meta = torch.abs(self._meta)
-        return node
+    Captured once per ``prompt[token][layer][module] = value`` call.
+    ActivationRef nodes snapshot the subset of WriteRecords that causally
+    affect their position at the moment of first instantiation.
+    """
+    write_id: int
+    token_selector: 'Selector'
+    layer_selector: 'Selector'
+    module: str
+    value_node: 'ComputationalNode'
 
 
 # ---------------------------------------------------------------------------
@@ -199,77 +298,95 @@ class ComputationalNode:
 
 class ActivationRef(ComputationalNode):
     """
-    A pointer to one or more activations selected by token/layer Selectors.
+    Atomic pointer to a single activation at one (token, layer, module) position.
 
     This is a leaf node: it holds no computation, only an address.  The
-    Executor fills in the actual tensor values via ``set_cache`` /
-    ``_layer_cache`` during a forward pass.
+    Executor fills in the actual tensor value via :meth:`set_cache` during
+    a forward pass.  Multiple selectors that cover overlapping positions
+    share the same ``ActivationRef`` object, guaranteeing identity and
+    avoiding duplicate extraction.
     """
 
     def __init__(
         self,
         prompt_id: int,
-        state_id: int,
-        token_selector: Selector,
-        layer_selector: Selector,
+        token_idx: int,
+        layer_idx: int,
         module: str,
+        dep_snapshot: List['WriteRecord'],
     ):
         self.prompt_id = prompt_id
-        self.state_id = state_id
-        self.token_selector = token_selector
-        self.layer_selector = layer_selector
+        self.token_idx = token_idx
+        self.layer_idx = layer_idx
         self.module = module
+        self.dep_snapshot: List['WriteRecord'] = dep_snapshot
         self._runtime_cache: Optional[torch.Tensor] = None
-        self._layer_cache: Dict[int, torch.Tensor] = {}
 
-        # Build meta tensor – shape is fully known at definition time
-        # when selectors have concrete bounds.  For open-ended slices
-        # (e.g. layer_selector = slice(None) when num_layers is unknown)
-        # we fall back to _meta = None (skip shape validation).
         D = ComputationalNode._HIDDEN_DIM_PLACEHOLDER
-        try:
-            shape = []
-            if not layer_selector.is_single:
-                shape.append(layer_selector.count)
-            if not token_selector.is_single:
-                shape.append(token_selector.count)
-            shape.append(D)
-            self._meta = torch.empty(shape, device='meta')
-        except ValueError:
-            self._meta = None
-
-    @property
-    def key(self) -> Tuple[int, int]:
-        """Lookup key for the Executor: (prompt_id, state_id)."""
-        return (self.prompt_id, self.state_id)
+        self._meta = torch.empty(D, device='meta')
 
     def evaluate(self) -> Optional[torch.Tensor]:
-        if self._runtime_cache is not None:
-            return self._runtime_cache
-        # Multi-layer assembly
-        if not self.layer_selector.is_single and self._layer_cache:
-            sorted_layers = sorted(self._layer_cache.keys())
-            self._runtime_cache = torch.stack(
-                [self._layer_cache[l] for l in sorted_layers]
-            )
-            return self._runtime_cache
-        return None  # Not yet filled by the executor
+        return self._runtime_cache
 
     def set_cache(self, activation: torch.Tensor):
-        """Called by the Executor inside a hook for single-layer refs."""
+        """Called by the Executor inside a hook to fill this ref."""
         self._runtime_cache = activation
-
-    def set_layer_cache(self, layer_idx: int, activation: torch.Tensor):
-        """Called by the Executor inside a hook for multi-layer refs."""
-        self._layer_cache[layer_idx] = activation
 
     def children(self) -> List[ComputationalNode]:
         return []
 
     def __repr__(self):
         return (
-            f"Ref(P{self.prompt_id}.S{self.state_id}"
-            f".T{self.token_selector}.L{self.layer_selector}.{self.module})"
+            f"Ref(P{self.prompt_id}"
+            f".T{self.token_idx}.L{self.layer_idx}.{self.module}"
+            f"[deps={len(self.dep_snapshot)}])"
+        )
+
+
+class ActivationRefGroup(ComputationalNode):
+    """
+    Composite node assembling multiple atomic :class:`ActivationRef` objects.
+
+    Created automatically when the user accesses a range of tokens and/or
+    layers (e.g. ``prompt[2:5][3]["resid_post"]``).  Overlapping ranges
+    share the underlying atomic refs via the Prompt's node registry.
+    """
+
+    def __init__(
+        self,
+        refs: List['ActivationRef'],
+        layer_count: int,
+        token_count: int,
+    ):
+        self._refs = refs
+        self._layer_count = layer_count
+        self._token_count = token_count
+
+        D = ComputationalNode._HIDDEN_DIM_PLACEHOLDER
+        shape: list = []
+        if layer_count > 1:
+            shape.append(layer_count)
+        if token_count > 1:
+            shape.append(token_count)
+        shape.append(D)
+        self._meta = torch.empty(shape, device='meta')
+
+    def evaluate(self) -> Optional[torch.Tensor]:
+        vals = [ref.evaluate() for ref in self._refs]
+        if any(v is None for v in vals):
+            return None
+        stacked = torch.stack(vals, dim=0)
+        if self._layer_count > 1 and self._token_count > 1:
+            return stacked.reshape(self._layer_count, self._token_count, -1)
+        return stacked
+
+    def children(self) -> List[ComputationalNode]:
+        return list(self._refs)
+
+    def __repr__(self):
+        return (
+            f"RefGroup(layers={self._layer_count}, tokens={self._token_count}, "
+            f"refs={len(self._refs)})"
         )
 
 
@@ -302,62 +419,8 @@ class ConstantNode(ComputationalNode):
 # Operation nodes
 # ---------------------------------------------------------------------------
 
-class BinaryOpNode(ComputationalNode):
-    """
-    A binary operation (add, sub, mul, div) recorded in the AST.
-    """
-
-    def __init__(
-        self,
-        left: ComputationalNode,
-        right: ComputationalNode,
-        op_func: callable,
-        op_symbol: str,
-    ):
-        self.left = left
-        self.right = right
-        self.op_func = op_func
-        self.op_symbol = op_symbol
-        self._runtime_cache: Optional[torch.Tensor] = None
-        # _meta is set by the caller (ComputationalNode.__add__ etc.)
-
-    def evaluate(self) -> Optional[torch.Tensor]:
-        if self._runtime_cache is not None:
-            return self._runtime_cache
-        val_l = self.left.evaluate()
-        val_r = self.right.evaluate()
-        if val_l is None or val_r is None:
-            return None
-        self._runtime_cache = self.op_func(val_l, val_r)
-        return self._runtime_cache
-
-    def children(self) -> List[ComputationalNode]:
-        return [self.left, self.right]
-
-    def __repr__(self):
-        return f"({self.left} {self.op_symbol} {self.right})"
 
 
-class UnaryOpNode(ComputationalNode):
-    """A unary operation (__neg__, __abs__) recorded in the AST."""
-
-    def __init__(self, operand: ComputationalNode, op_func: callable, op_symbol: str):
-        self.operand = operand
-        self.op_func = op_func
-        self.op_symbol = op_symbol
-        # _meta is set by the caller
-
-    def evaluate(self) -> Optional[torch.Tensor]:
-        val = self.operand.evaluate()
-        if val is None:
-            return None
-        return self.op_func(val)
-
-    def children(self) -> List[ComputationalNode]:
-        return [self.operand]
-
-    def __repr__(self):
-        return f"{self.op_symbol}({self.operand})"
 
 
 class TorchFunctionNode(ComputationalNode):
