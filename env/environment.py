@@ -5,7 +5,7 @@ import sys
 import io
 from typing import Any, Dict, Set
 
-from witt import Prompt, PromptList, load_model, load_tokenizer, tokenize, Executor
+from witt import Prompt, PromptList, load_model, load_tokenizer, tokenize, Executor, Chat, complete_chat
 
 
 class HelpDisplay:
@@ -80,7 +80,7 @@ class ExecutionEnvironment:
         
         # Core executor for model inference with activation patching
         self.executor = Executor(self.model, self.tokenizer, self.prompts)
-        
+
         # The persistent namespace for exec() with protected keys
         self._namespace = ProtectedNamespace(self.PROTECTED_KEYS)
         
@@ -92,7 +92,21 @@ class ExecutionEnvironment:
 
         # Is silent result?
         self._is_silent_result = False
-    
+
+        # Active chat session (for CHAT mode)
+        self._active_chat = None
+
+    # ------------------------------------------------------------------
+    # Context manager — activates the executor for the session
+    # ------------------------------------------------------------------
+
+    def __enter__(self):
+        self.executor.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self.executor.__exit__(*exc)
+
     def _setup_namespace(self):
         """Initialize the namespace with useful bindings."""
         self._namespace.update({
@@ -207,6 +221,34 @@ class ExecutionEnvironment:
         self._setup_namespace()
         self._namespace.lock()
     
+    def chat_message(self, text: str) -> str:
+        """
+        Process a user message in CHAT mode.
+
+        Creates or continues a multi-turn conversation.  The Chat object
+        is stored in ``prompts`` for later COMMAND mode manipulation.
+        """
+        if self._active_chat is None:
+            self._active_chat = Chat()
+            self.prompts.add(self._active_chat)
+
+        # Add user message
+        self._active_chat.add_user(text)
+
+        # Complete the chat
+        response = complete_chat(
+            self.model, self.tokenizer, self._active_chat,
+        )
+
+        # Add assistant response
+        self._active_chat.add_assistant(response)
+
+        return response
+
+    def reset_chat(self):
+        """Start a new chat session (next CHAT mode entry creates a fresh Chat)."""
+        self._active_chat = None
+
     def _show_help(self):
         """Print help about available commands and variables."""
         help_lines = [

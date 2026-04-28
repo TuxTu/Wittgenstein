@@ -2,7 +2,8 @@ from typing import Optional, List, Tuple, Union, Dict
 from typing_extensions import TypedDict, NotRequired
 from enum import Enum
 
-from .prompt import Prompt, TokenProxy, decode_bpe_token
+from .prompt import Prompt, ActivationView
+from .tokenize import decode_bpe_token
 from .selector import Selector
 
 
@@ -22,12 +23,12 @@ class ContentProxy:
         self.length = end_idx - start_idx
         self.field = field  # "content" or "reasoning_content"
     
-    def __getitem__(self, key: Union[int, slice, list]) -> TokenProxy:
+    def __getitem__(self, key: Union[int, slice, list]) -> ActivationView:
         """
         Access token(s) by relative index/slice/list within this content span.
-        
+
         The relative key is translated to global token indices before
-        creating a TokenProxy with an appropriate Selector.
+        creating an ActivationView with an appropriate Selector.
         """
         if isinstance(key, int):
             # Single index – translate to global
@@ -45,7 +46,7 @@ class ContentProxy:
             start, stop, step = key.indices(self.length)
             global_slice = slice(self.start_idx + start, self.start_idx + stop, step)
             sel = Selector.from_key(global_slice)
-            return TokenProxy(self.chat, sel)
+            return ActivationView(self.chat, sel)
         elif isinstance(key, (list, tuple)):
             # Translate relative list to global list
             global_indices = []
@@ -58,7 +59,7 @@ class ContentProxy:
                     )
                 global_indices.append(self.start_idx + idx)
             sel = Selector.from_key(global_indices)
-            return TokenProxy(self.chat, sel)
+            return ActivationView(self.chat, sel)
         else:
             raise TypeError(f"Invalid key type: {type(key)}")
     
@@ -76,7 +77,7 @@ class MessageProxy:
     Access patterns:
     - msg["content"] → ContentProxy for content tokens
     - msg["reasoning_content"] → ContentProxy for reasoning tokens (if exists)
-    - msg[token_idx] → TokenProxy (shortcut for msg["content"][token_idx])
+    - msg[token_idx] → ActivationView (shortcut for msg["content"][token_idx])
     """
     
     def __init__(self, chat: "Chat", token_ranges: Dict[str, Tuple[int, int]]):
@@ -92,13 +93,13 @@ class MessageProxy:
         """Check if this message has reasoning_content."""
         return "reasoning_content" in self.token_ranges and self.token_ranges["reasoning_content"] is not None
     
-    def __getitem__(self, key: Union[str, int]) -> Union[ContentProxy, TokenProxy]:
+    def __getitem__(self, key: Union[str, int]) -> Union[ContentProxy, ActivationView]:
         """
         Access by field name or token index.
         
         - msg["content"] → ContentProxy for content
         - msg["reasoning_content"] → ContentProxy for reasoning (raises if not present)
-        - msg[5] → TokenProxy for token at index 5 in content
+        - msg[5] → ActivationView for token at index 5 in content
         """
         if isinstance(key, str):
             if key == "content":
@@ -163,18 +164,68 @@ class Chat(Prompt):
         super().__init__()  # Initialize with empty tokens
 
         self.messages_in_tokens = {}
-        
+        self._messages: List[ChatMessage] = []
+
         if messages and tokens:
             self.append(messages, tokens)
+
+    @property
+    def messages(self) -> List[ChatMessage]:
+        """Return the ordered list of chat messages."""
+        return list(self._messages)
+
+    def add_message(self, role: str, content: str, reasoning_content: Optional[str] = None):
+        """
+        Add a message and tokenize it via the active executor's tokenizer.
+
+        Requires an active executor context (``with executor:``).
+        """
+        from .executor import get_active_executor
+        exe = get_active_executor()
+        if exe is None:
+            raise RuntimeError(
+                "No active executor. Use 'with executor:' to set one, "
+                "or use chat.append(messages, tokens) directly."
+            )
+        msg: ChatMessage = {"role": role, "content": content}
+        if reasoning_content:
+            msg["reasoning_content"] = reasoning_content
+
+        # Tokenize the full conversation so far + new message
+        all_messages = self._messages + [msg]
+        text = exe.tokenizer.apply_chat_template(
+            all_messages, tokenize=False, add_generation_prompt=(role != "assistant"),
+        )
+        from .tokenize import tokenize
+        new_tokens = tokenize(exe.tokenizer, text)
+
+        # Replace all tokens (re-tokenization of full conversation)
+        self.tokens = []
+        self.messages_in_tokens = {}
+        self._messages = []
+        self.append(all_messages, new_tokens)
+
+    def add_user(self, content: str):
+        """Add a user message."""
+        self.add_message("user", content)
+
+    def add_assistant(self, content: str, reasoning_content: Optional[str] = None):
+        """Add an assistant message."""
+        self.add_message("assistant", content, reasoning_content)
+
+    def add_system(self, content: str):
+        """Add a system message."""
+        self.add_message("system", content)
 
     def append(self, new_messages: List[ChatMessage], new_tokens: List[Tuple[int, str]]):
         if not new_messages or not new_tokens:
             return
-            
+
         remaining_tokens = [t[1] for t in new_tokens] if new_tokens else []
         idx_shift = len(self.tokens)
 
         for message in new_messages:
+            self._messages.append(message)
             role = message["role"]
             assert role in [r.value for r in self.RoleType], f"Unknown role: {role}"
             
@@ -206,14 +257,14 @@ class Chat(Prompt):
         
         super().append(new_tokens)
 
-    def __getitem__(self, key: Union[str, int, slice, list]) -> Union[RoleProxy, TokenProxy]:
+    def __getitem__(self, key: Union[str, int, slice, list]) -> Union[RoleProxy, ActivationView]:
         """
         Access by role name, token index, slice, or list.
-        
+
         - chat["user"]  -> RoleProxy for user messages
-        - chat[5]       -> TokenProxy (single token)
-        - chat[3:7]     -> TokenProxy (token range)
-        - chat[[0,2,4]] -> TokenProxy (token list)
+        - chat[5]       -> ActivationView (single token)
+        - chat[3:7]     -> ActivationView (token range)
+        - chat[[0,2,4]] -> ActivationView (token list)
         """
         if isinstance(key, str):
             # Access by role name
@@ -225,6 +276,6 @@ class Chat(Prompt):
         else:
             raise TypeError(f"Invalid key type: {type(key)}")
 
-    def prompt_getitem(self, key: Union[int, slice, list]) -> TokenProxy:
+    def prompt_getitem(self, key: Union[int, slice, list]) -> ActivationView:
         """Call parent Prompt's __getitem__ for token access."""
         return super().__getitem__(key)

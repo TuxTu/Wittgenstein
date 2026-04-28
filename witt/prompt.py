@@ -2,43 +2,18 @@
 Prompt storage classes for the witt library.
 """
 from typing import Optional, List, Any, Tuple, Union, Dict, overload
-import functools
 
-from .computational_node import ComputationalNode, ActivationRef, ActivationRefGroup, ConstantNode, WriteRecord
+from .computational_node import (
+    ComputationalNode,
+    ActivationAddress,
+    ActivationAddressGroup,
+    ActivationRef,
+    ActivationRefGroup,
+    ConstantNode,
+    WriteRecord,
+)
 from .selector import Selector, IndexSelector, SliceSelector, ListSelector
-
-
-@functools.lru_cache(maxsize=1)
-def _get_byte_decoder() -> Dict[str, int]:
-    """
-    Build the reverse mapping from GPT-2 BPE unicode characters to bytes.
-    This is the inverse of the byte_encoder used in GPT-2/BPE tokenizers.
-    """
-    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
-    cs = bs[:]
-
-    n = 0
-    for b in range(256):
-        if b not in bs:
-            bs.append(b)
-            cs.append(256 + n)
-            n += 1
-
-    return {chr(c): b for b, c in zip(bs, cs)}
-
-
-def decode_bpe_token(token_str: str) -> str:
-    """
-    Decode a BPE token string to its actual text representation.
-    Handles all GPT-2 style byte-level encodings (Ġ for space, Ċ for newline,
-    em-dashes, curly quotes, etc.)
-    """
-    byte_decoder = _get_byte_decoder()
-    try:
-        byte_values = bytes([byte_decoder.get(c, ord(c)) for c in token_str])
-        return byte_values.decode('utf-8', errors='replace')
-    except Exception:
-        return token_str
+from .tokenize import decode_bpe_token
 
 
 # ---------------------------------------------------------------------------
@@ -127,12 +102,13 @@ class Prompt:
     Ledger / registry:
         Every ``prompt[tok][layer][module] = value`` call appends a
         :class:`WriteRecord` to ``_ledger``.  Every read access
-        ``prompt[tok][layer][module]`` instantiates an :class:`ActivationRef`
-        that is cached in ``_node_registry`` — repeated or overlapping reads
-        reuse the same object identity.
+        ``prompt[tok][layer][module]`` returns a stable activation address
+        cached in ``_address_registry``.  Call ``.snapshot()`` on that address
+        to freeze the current causal write state into an :class:`ActivationRef`.
     """
 
     _next_uid: int = 0
+    VALID_MODULE_NAMES = {"resid_pre", "resid_post", "mlp", "attn"}
 
     def __init__(self, tokens: Optional[List[Tuple[int, str]]] = None):
         self.tokens = tokens or []
@@ -145,9 +121,13 @@ class Prompt:
         self._ledger: List[WriteRecord] = []
         self._write_id_counter: int = 0
 
-        # Atomic node registry: (token_idx, layer_idx, module) → ActivationRef.
-        # Overlapping selectors share the same atomic ref objects.
-        self._node_registry: Dict[Tuple[int, int, str], ActivationRef] = {}
+        # Stable address registry: (token_idx, layer_idx, module) → ActivationAddress.
+        # Overlapping selectors share the same atomic address objects.
+        self._address_registry: Dict[Tuple[int, int, str], ActivationAddress] = {}
+
+        # Group cache: (token_sel, layer_sel, module) → ActivationAddressGroup.
+        # Ensures range accesses return the same group object on repeated calls.
+        self._address_group_cache: Dict[Tuple, Union[ActivationAddress, ActivationAddressGroup]] = {}
 
     # ------------------------------------------------------------------
     # Token properties
@@ -192,10 +172,11 @@ class Prompt:
         """
         Append an activation write to the modification ledger.
 
-        Called by :meth:`LayerProxy.__setitem__`.  Later writes to the same
+        Called by :meth:`ActivationView.__setitem__`.  Later writes to the same
         ``(token_sel, layer_sel, module)`` key override earlier ones at
         inference time (see :meth:`effective_writes`).
         """
+        self.validate_module_name(module)
         wr = WriteRecord(
             write_id=self._write_id_counter,
             token_selector=token_sel,
@@ -224,6 +205,7 @@ class Prompt:
         self,
         token_sel: Selector,
         layer_sel: Selector,
+        effective_writes: Optional[List[WriteRecord]] = None,
     ) -> List[WriteRecord]:
         """
         Return the effective writes that causally affect ``(token_sel, layer_sel)``.
@@ -247,8 +229,10 @@ class Prompt:
         target_tok_max = _sel_max(token_sel, n_tok)
         target_layer_max = _sel_max(layer_sel, None)
 
+        writes = effective_writes if effective_writes is not None else self.effective_writes()
+
         affecting: List[WriteRecord] = []
-        for wr in self.effective_writes():
+        for wr in writes:
             write_tok_min = _sel_min(wr.token_selector, n_tok)
             write_layer_min = _sel_min(wr.layer_selector, None)
 
@@ -263,24 +247,109 @@ class Prompt:
     # Node registry API
     # ------------------------------------------------------------------
 
-    def get_or_instantiate_ref(
+    @classmethod
+    def validate_module_name(cls, module: str) -> None:
+        """Validate that the requested activation hook name is supported."""
+        if module not in cls.VALID_MODULE_NAMES:
+            allowed = ", ".join(sorted(cls.VALID_MODULE_NAMES))
+            raise KeyError(
+                f"Unknown activation module {module!r}. "
+                f"Expected one of: {allowed}."
+            )
+
+    def _resolve_snapshot_layer_idx(self, layer_idx: int) -> int:
+        """
+        Resolve a layer index for snapshotting.
+
+        Negative indices require the real layer count, which is injected while
+        an executor is active.
+        """
+        n_layers = ComputationalNode._NUM_LAYERS
+        resolved = layer_idx
+        if resolved < 0:
+            if n_layers is None:
+                raise ValueError(
+                    "Cannot snapshot a negative layer index without knowing "
+                    "num_layers. Enter a 'with executor:' context or use a "
+                    "non-negative layer index."
+                )
+            resolved += n_layers
+        if n_layers is not None and (resolved < 0 or resolved >= n_layers):
+            raise IndexError(
+                f"Layer index {layer_idx} out of range [-{n_layers}, {n_layers})"
+            )
+        return resolved
+
+    def snapshot_address(self, address: ActivationAddress) -> ActivationRef:
+        """Freeze an activation address against the prompt's current ledger."""
+        return self.snapshot_addresses([address])[0]
+
+    def snapshot_addresses(self, addresses: List[ActivationAddress]) -> List[ActivationRef]:
+        """
+        Freeze multiple activation addresses against one shared ledger snapshot.
+
+        This avoids rescanning the full effective write set for every coordinate
+        when a range of addresses is frozen together.
+        """
+        if not addresses:
+            return []
+
+        effective = self.effective_writes()
+        refs: List[ActivationRef] = []
+        for address in addresses:
+            if address._prompt is not self:
+                raise ValueError(
+                    "All activation addresses in a batch snapshot must belong "
+                    "to the same Prompt."
+                )
+            layer_idx = self._resolve_snapshot_layer_idx(address.layer_idx)
+            dep = self.get_affecting_writes(
+                IndexSelector(address.token_idx),
+                IndexSelector(layer_idx),
+                effective_writes=effective,
+            )
+            refs.append(
+                ActivationRef(
+                    prompt_id=self.uid,
+                    token_idx=address.token_idx,
+                    layer_idx=layer_idx,
+                    module=address.module,
+                    dep_snapshot=dep,
+                )
+            )
+        return refs
+
+    def snapshot_group(self, group: ActivationAddressGroup) -> ActivationRefGroup:
+        """Freeze an activation address group into one ActivationRefGroup."""
+        refs = self.snapshot_addresses(group._addresses)
+        return ActivationRefGroup(
+            refs,
+            layer_count=group._layer_count,
+            token_count=group._token_count,
+        )
+
+    def get_or_instantiate_address(
         self,
         token_sel: Selector,
         layer_sel: Selector,
         module: str,
-    ) -> ComputationalNode:
+    ) -> Union[ActivationAddress, ActivationAddressGroup]:
         """
-        Return the node for this coordinate, creating atomic refs on first
-        access.
+        Return the stable address object for this coordinate, creating atomic
+        addresses on first access.
 
-        Range selectors are decomposed into individual :class:`ActivationRef`
-        objects (one per token/layer pair).  Overlapping ranges reuse the
-        same atomic refs via ``_node_registry``.  Returns a single
-        :class:`ActivationRef` for scalar selectors or an
-        :class:`ActivationRefGroup` for ranges.
-
-        Dependency snapshots are frozen per-atom at first instantiation.
+        Range selectors are decomposed into individual
+        :class:`ActivationAddress` objects (one per token/layer pair).
+        Overlapping ranges reuse the same atomic addresses via
+        ``_address_registry``.  Returns a single :class:`ActivationAddress`
+        for scalar selectors or an :class:`ActivationAddressGroup` for ranges.
         """
+        self.validate_module_name(module)
+
+        # Check group cache for repeated range accesses
+        group_key = (token_sel, layer_sel, module)
+        if group_key in self._address_group_cache:
+            return self._address_group_cache[group_key]
 
         n_tok = len(self.tokens)
         tok_indices = (
@@ -291,40 +360,41 @@ class Prompt:
 
         layer_indices = layer_sel.indices_bounded()
         if layer_indices is None:
+            n_layers = ComputationalNode._NUM_LAYERS
             if layer_sel.is_single:
                 layer_indices = [layer_sel._index]
+            elif n_layers is not None:
+                layer_indices = layer_sel.indices(n_layers)
             else:
                 raise ValueError(
                     f"Cannot decompose layer selector {layer_sel!r} without "
-                    "knowing num_layers.  Use concrete non-negative bounds."
+                    "knowing num_layers.  Use concrete non-negative bounds "
+                    "or enter a 'with executor:' context."
                 )
 
-        refs: list = []
+        addresses: list = []
         for li in layer_indices:
             for ti in tok_indices:
                 atom_key = (ti, li, module)
-                if atom_key not in self._node_registry:
-                    dep = self.get_affecting_writes(
-                        IndexSelector(ti), IndexSelector(li),
-                    )
-                    self._node_registry[atom_key] = ActivationRef(
-                        prompt_id=self.uid,
+                if atom_key not in self._address_registry:
+                    self._address_registry[atom_key] = ActivationAddress(
+                        prompt=self,
                         token_idx=ti,
                         layer_idx=li,
                         module=module,
-                        dep_snapshot=dep,
                     )
-                refs.append(self._node_registry[atom_key])
+                addresses.append(self._address_registry[atom_key])
 
-        if len(refs) == 1:
-            result: ComputationalNode = refs[0]
+        if len(addresses) == 1:
+            result: Union[ActivationAddress, ActivationAddressGroup] = addresses[0]
         else:
-            result = ActivationRefGroup(
-                refs,
+            result = ActivationAddressGroup(
+                addresses,
                 layer_count=len(layer_indices),
                 token_count=len(tok_indices),
             )
 
+        self._address_group_cache[group_key] = result
         return result
 
     # ------------------------------------------------------------------
@@ -335,9 +405,9 @@ class Prompt:
         """
         Access tokens by index, slice, or list of indices.
 
-        - prompt[3]     -> TokenProxy with IndexSelector
-        - prompt[3:7]   -> TokenProxy with SliceSelector
-        - prompt[[0,2]] -> TokenProxy with ListSelector
+        - prompt[3]     -> ActivationView with IndexSelector
+        - prompt[3:7]   -> ActivationView with SliceSelector
+        - prompt[[0,2]] -> ActivationView with ListSelector
         """
         sel = Selector.from_key(key)
         n = len(self.tokens)
@@ -350,7 +420,43 @@ class Prompt:
         if isinstance(key, slice):
             concrete = slice(*key.indices(n))
             sel = SliceSelector(concrete)
-        return TokenProxy(self, sel)
+        return ActivationView(self, sel)
+
+    def generate(self, **kwargs) -> str:
+        """Generate text using the active executor. Requires ``with executor:`` context."""
+        from .executor import get_active_executor
+        exe = get_active_executor()
+        if exe is None:
+            raise RuntimeError(
+                "No active executor. Use 'with executor:' to set one."
+            )
+        return exe.generate(self, **kwargs)
+
+    def forward(self, extraction_targets=None):
+        """
+        Single forward pass via the active executor.
+
+        Optionally accepts extraction targets as activation addresses,
+        activation snapshots, or iterables of those objects. Requires
+        ``with executor:`` context.
+        """
+        from .executor import get_active_executor
+        exe = get_active_executor()
+        if exe is None:
+            raise RuntimeError(
+                "No active executor. Use 'with executor:' to set one."
+            )
+        return exe.forward(self, extraction_targets=extraction_targets)
+
+    def step(self):
+        """Generate one token via the active executor. Requires ``with executor:`` context."""
+        from .executor import get_active_executor
+        exe = get_active_executor()
+        if exe is None:
+            raise RuntimeError(
+                "No active executor. Use 'with executor:' to set one."
+            )
+        return exe.step(self)
 
     def append(self, new_tokens: List[Tuple[int, str]]):
         self.tokens.extend(new_tokens)
@@ -388,89 +494,142 @@ class Prompt:
 
 
 # ---------------------------------------------------------------------------
-# Proxy chain:  Prompt -> TokenProxy -> LayerProxy -> ActivationRef
+# Proxy chain:  Prompt -> ActivationView -> ActivationView -> ActivationAddress
 # ---------------------------------------------------------------------------
 
-class TokenProxy:
+class ActivationView(ComputationalNode):
     """
-    Proxy for accessing token-level operations on a prompt.
+    Progressive view into a prompt's activation space.
 
-    Stores a Selector for the token dimension.  The next ``__getitem__``
-    call selects layers and produces a ``LayerProxy``.
+    This is a :class:`ComputationalNode` subclass so that token/layer
+    selection participates naturally in the lazy graph API until the final
+    module name is chosen.  At that point, indexing returns a stable
+    activation address object which can later be frozen via ``.snapshot()``.
+
+    Indexing chain::
+
+        Prompt[tok]         → ActivationView(token_sel, layer_sel=None)
+        view[layer]         → ActivationView(token_sel, layer_sel)
+        view["module"]      → ActivationAddress or ActivationAddressGroup
+        view["module"] = v  → WriteRecord appended to prompt ledger
     """
 
-    def __init__(self, prompt: Prompt, token_selector: Selector):
-        self.prompt = prompt
-        self.token_selector = token_selector
+    def __init__(self, prompt: Prompt, token_selector: Selector, layer_selector: Optional[Selector] = None):
+        self._prompt = prompt
+        self._token_sel = token_selector
+        self._layer_sel = layer_selector
+        self._meta = None  # Partial view — no concrete tensor shape yet
+
+    # -- Override OperatorMeta-injected equality to keep identity semantics --
+    __eq__ = object.__eq__
+    __hash__ = object.__hash__
 
     def __repr__(self) -> str:
-        if self.token_selector.is_single:
-            idx = self.token_selector._index
-            decoded = decode_bpe_token(self.prompt.tokens[idx][1])
-            return f"Token({idx}, {decoded!r})"
-        return f"Token({self.token_selector})"
+        if self._layer_sel is None:
+            if self._token_sel.is_single:
+                idx = self._token_sel._index
+                decoded = decode_bpe_token(self._prompt.tokens[idx][1])
+                return f"View(P{self._prompt.uid}, tok={idx}, {decoded!r})"
+            return f"View(P{self._prompt.uid}, tok={self._token_sel})"
+        return f"View(P{self._prompt.uid}, tok={self._token_sel}, layer={self._layer_sel})"
 
-    def __getitem__(self, key: Union[int, slice, list]):
+    # -- Progressive indexing (overrides ComputationalNode.__getitem__) --
+
+    def __getitem__(self, key):
         """
-        Select layer(s).
+        Progressive narrowing of the activation space.
 
-        - prompt[3][5]     -> LayerProxy with IndexSelector
-        - prompt[3][2:5]   -> LayerProxy with SliceSelector
-        - prompt[3][[1,3]] -> LayerProxy with ListSelector
+        - If layer not yet selected: interpret *key* as a layer selector.
+        - If layer is selected and *key* is a ``str``: resolve to
+          :class:`ActivationAddress` / :class:`ActivationAddressGroup`.
         """
-        layer_sel = Selector.from_key(key)
-        return LayerProxy(self.prompt, self.token_selector, layer_sel)
+        if self._layer_sel is None:
+            # Second bracket: select layer(s)
+            layer_sel = Selector.from_key(key)
+            # Validate against real layer count when available
+            n_layers = ComputationalNode._NUM_LAYERS
+            if n_layers is not None and layer_sel.is_single:
+                idx = layer_sel._index
+                if idx < -n_layers or idx >= n_layers:
+                    raise IndexError(
+                        f"Layer index {idx} out of range [-{n_layers}, {n_layers})"
+                    )
+            return ActivationView(self._prompt, self._token_sel, layer_sel)
 
+        if isinstance(key, str):
+            # Third bracket: module name → resolve to stable address object
+            return self._prompt.get_or_instantiate_address(
+                self._token_sel,
+                self._layer_sel,
+                key,
+            )
 
-class LayerProxy:
-    """
-    Proxy for accessing layer-level operations on token(s).
-
-    Stores Selectors for both token and layer dimensions.
-
-    - ``__getitem__(module)``  returns the :class:`ActivationRef` for this
-      coordinate from the prompt's node registry (identity-preserving).
-    - ``__setitem__(module, value)``  records a write to the prompt's ledger.
-    """
-
-    def __init__(self, prompt: Prompt, token_selector: Selector, layer_selector: Selector):
-        self.prompt = prompt
-        self.token_selector = token_selector
-        self.layer_selector = layer_selector
-
-    def __repr__(self) -> str:
-        return f"Layer({self.layer_selector}, Token({self.token_selector}))"
-
-    def __getitem__(self, module: str) -> ComputationalNode:
-        """
-        Return (or instantiate) the node for this coordinate.
-
-        For single token/layer this is an :class:`ActivationRef`; for ranges
-        it is an :class:`ActivationRefGroup` of atomic refs.  Snapshots are
-        frozen per-atom at first instantiation.
-        """
-        return self.prompt.get_or_instantiate_ref(
-            self.token_selector,
-            self.layer_selector,
-            module,
+        raise TypeError(
+            f"Expected a module name (str), got {type(key).__name__}. "
+            "Use view[layer]['module_name'] to access activations."
         )
 
-    def __setitem__(self, module: str, value_node):
+    def __setitem__(self, key, value_node):
         """
         Record an activation write to the prompt's modification ledger.
 
-        Any :class:`ComputationalNode` is accepted as the value.
+        Requires that both token and layer selectors are set.
         Raw scalars/tensors are wrapped in :class:`ConstantNode` automatically.
         """
+        if self._layer_sel is None:
+            raise TypeError(
+                "Layer not yet selected. "
+                "Use prompt[token][layer]['module'] = value."
+            )
+        if not isinstance(key, str):
+            raise TypeError(
+                f"Module key must be a str, got {type(key).__name__}."
+            )
+        if isinstance(value_node, (ActivationAddress, ActivationAddressGroup)):
+            raise TypeError(
+                "Activation addresses are not frozen values. Call .snapshot() "
+                "before assigning them."
+            )
         if not isinstance(value_node, ComputationalNode):
             value_node = ConstantNode(value_node)
 
-        self.prompt.record_write(
-            token_sel=self.token_selector,
-            layer_sel=self.layer_selector,
-            module=module,
+        self._prompt.record_write(
+            token_sel=self._token_sel,
+            layer_sel=self._layer_sel,
+            module=key,
             value_node=value_node,
         )
+
+    # -- Block stray attribute access (overrides ComputationalNode.__getattr__) --
+
+    def __getattr__(self, name):
+        if name.startswith('_'):
+            raise AttributeError(name)
+        raise AttributeError(
+            f"ActivationView has no attribute '{name}'. "
+            "Use [layer_index] then ['module_name'] to access activations."
+        )
+
+    # -- Block arithmetic on views (overrides ComputationalNode.__torch_function__) --
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        for a in args:
+            if isinstance(a, ActivationView):
+                raise TypeError(
+                    "Cannot perform tensor operations on an ActivationView. "
+                    "Fully resolve to an activation snapshot first: "
+                    "view[layer]['module'].snapshot()"
+                )
+        return super().__torch_function__(func, types, args, kwargs)
+
+    # -- A view is not a concrete value --
+
+    def evaluate(self):
+        return None
+
+    def children(self):
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -478,10 +637,11 @@ class LayerProxy:
 # ---------------------------------------------------------------------------
 
 class PromptList:
-    """A collection of prompts with lookup by uid."""
+    """An ordered collection of prompts with explicit lookup by uid."""
 
     def __init__(self):
         self._prompts: Dict[int, Prompt] = {}
+        self._order: List[int] = []
 
     @overload
     def add(self, prompt: Prompt) -> Prompt: ...
@@ -505,20 +665,41 @@ class PromptList:
         else:
             prompt = Prompt(tokens=tokens_or_prompt)
 
+        if prompt.uid not in self._prompts:
+            self._order.append(prompt.uid)
         self._prompts[prompt.uid] = prompt
         return prompt
 
-    def __getitem__(self, uid: int) -> Prompt:
+    def by_uid(self, uid: int) -> Prompt:
+        """Look up a prompt by its immutable uid."""
         return self._prompts[uid]
 
-    def __contains__(self, uid: int) -> bool:
-        return uid in self._prompts
+    def __getitem__(self, key: Union[int, slice]) -> Union[Prompt, List[Prompt]]:
+        """
+        Positional access by insertion order.
+
+        - ``prompts[0]`` returns the first prompt
+        - ``prompts[-1]`` returns the most recent prompt
+        - ``prompts[1:3]`` returns a list of prompts
+        """
+        if isinstance(key, slice):
+            uids = self._order[key]
+            return [self._prompts[uid] for uid in uids]
+        if isinstance(key, int):
+            uid = self._order[key]
+            return self._prompts[uid]
+        raise TypeError(f"PromptList indices must be int or slice, got {type(key).__name__}")
+
+    def __contains__(self, item) -> bool:
+        if isinstance(item, Prompt):
+            return item.uid in self._prompts
+        return item in self._prompts
 
     def __len__(self) -> int:
-        return len(self._prompts)
+        return len(self._order)
 
     def __iter__(self):
-        return iter(self._prompts.values())
+        return (self._prompts[uid] for uid in self._order)
 
     def __repr__(self) -> str:
         return f"PromptList({len(self._prompts)} prompts)"
@@ -526,6 +707,6 @@ class PromptList:
     @property
     def last(self) -> Optional[Prompt]:
         """Get the most recently added prompt."""
-        if not self._prompts:
+        if not self._order:
             return None
-        return list(self._prompts.values())[-1]
+        return self._prompts[self._order[-1]]

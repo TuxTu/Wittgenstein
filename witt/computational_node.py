@@ -51,8 +51,6 @@ def _resolve_key(key):
 
 def _build_operator_mappings():
     """Automatically build operator mappings by scanning operator module."""
-    import operator as pyop
-
     # Auto-discover operator functions from operator module
     # Pattern: most map operator.func → __func__ dunder
     # Special cases handled in overrides
@@ -86,6 +84,18 @@ def _build_operator_mappings():
         elif name == 'invert':
             dunder = '__invert__'
             torch_name = 'bitwise_not'
+        elif name == 'lt':
+            dunder = '__lt__'
+            torch_name = 'less'
+        elif name == 'le':
+            dunder = '__le__'
+            torch_name = 'less_equal'
+        elif name == 'gt':
+            dunder = '__gt__'
+            torch_name = 'greater'
+        elif name == 'ge':
+            dunder = '__ge__'
+            torch_name = 'greater_equal'
         elif name == 'truediv':
             dunder = '__truediv__'
             torch_name = 'true_divide'
@@ -205,7 +215,9 @@ class ComputationalNode(metaclass=OperatorMeta):
 
     # Fixed placeholder for shape validation.  All activations share the same
     # hidden_dim so the actual value never causes incompatibilities.
+    # Inside a ``with executor:`` block these are set to real model values.
     _HIDDEN_DIM_PLACEHOLDER: ClassVar[int] = 64
+    _NUM_LAYERS: ClassVar[Optional[int]] = None
 
     _meta: Optional[torch.Tensor] = None
 
@@ -217,12 +229,35 @@ class ComputationalNode(metaclass=OperatorMeta):
         """Return child nodes for graph traversal. Override in subclasses."""
         return []
 
+    def leaf_refs(self) -> List['ActivationRef']:
+        """Recursively collect all unfilled ActivationRef leaves from this node's graph."""
+        if isinstance(self, ActivationRef) and self.evaluate() is None:
+            return [self]
+        leaves: List['ActivationRef'] = []
+        for child in self.children():
+            leaves.extend(child.leaf_refs())
+        return leaves
+
     # ------------------------------------------------------------------
     # Evaluate (replays the recorded operation on real tensors)
     # ------------------------------------------------------------------
 
     def evaluate(self) -> Optional[torch.Tensor]:
         raise NotImplementedError
+
+    def eval(self) -> torch.Tensor:
+        """
+        Evaluate this node to a concrete tensor via the active executor.
+
+        Fills all unfilled leaf dependencies first.  Requires ``with executor:``.
+        """
+        from .executor import get_active_executor
+        exe = get_active_executor()
+        if exe is None:
+            raise RuntimeError(
+                "No active executor. Use 'with executor:' to set one."
+            )
+        return exe.eval(self)
 
     # ------------------------------------------------------------------
     # __torch_function__  –  intercepts torch.xxx(node, ...)
@@ -282,8 +317,8 @@ class WriteRecord:
     A single activation write recorded in a Prompt's modification ledger.
 
     Captured once per ``prompt[token][layer][module] = value`` call.
-    ActivationRef nodes snapshot the subset of WriteRecords that causally
-    affect their position at the moment of first instantiation.
+    Frozen activation snapshots capture the subset of WriteRecords that
+    causally affect their position at snapshot time.
     """
     write_id: int
     token_selector: 'Selector'
@@ -293,18 +328,99 @@ class WriteRecord:
 
 
 # ---------------------------------------------------------------------------
-# Leaf nodes
+# Stable activation addresses
+# ---------------------------------------------------------------------------
+
+class _AddressErrorMixin:
+    """Shared guardrails for stable activation addresses."""
+
+    __eq__ = object.__eq__
+    __hash__ = object.__hash__
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        raise TypeError(
+            "Activation addresses are not frozen values. Call .snapshot() "
+            "before using them in tensor operations."
+        )
+
+    def eval(self):
+        raise TypeError(
+            "Activation addresses cannot be evaluated directly. "
+            "Call .snapshot().eval() instead."
+        )
+
+
+class ActivationAddress(_AddressErrorMixin):
+    """
+    Stable pointer to one activation coordinate.
+
+    Unlike :class:`ActivationRef`, an address does not freeze causal writes.
+    Call :meth:`snapshot` to create a fresh frozen ref from the prompt's
+    current ledger state.
+    """
+
+    def __init__(self, prompt, token_idx: int, layer_idx: int, module: str):
+        self._prompt = prompt
+        self.prompt_id = prompt.uid
+        self.token_idx = token_idx
+        self.layer_idx = layer_idx
+        self.module = module
+
+    def snapshot(self) -> 'ActivationRef':
+        """Freeze the address against the prompt's current effective writes."""
+        return self._prompt.snapshot_address(self)
+
+    def __repr__(self) -> str:
+        return (
+            f"Addr(P{self.prompt_id}"
+            f".T{self.token_idx}.L{self.layer_idx}.{self.module})"
+        )
+
+
+class ActivationAddressGroup(_AddressErrorMixin):
+    """
+    Stable collection of activation addresses created from a token/layer range.
+
+    Call :meth:`snapshot` to freeze the full group into an
+    :class:`ActivationRefGroup`.
+    """
+
+    def __init__(
+        self,
+        addresses: List['ActivationAddress'],
+        layer_count: int,
+        token_count: int,
+    ):
+        self._addresses = addresses
+        self._layer_count = layer_count
+        self._token_count = token_count
+
+    def snapshot(self) -> 'ActivationRefGroup':
+        """Freeze each address in the group into a fresh ActivationRefGroup."""
+        if not self._addresses:
+            raise ValueError("Cannot snapshot an empty ActivationAddressGroup")
+        return self._addresses[0]._prompt.snapshot_group(self)
+
+    def __repr__(self) -> str:
+        return (
+            f"AddrGroup(layers={self._layer_count}, tokens={self._token_count}, "
+            f"addrs={len(self._addresses)})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Frozen snapshot nodes
 # ---------------------------------------------------------------------------
 
 class ActivationRef(ComputationalNode):
     """
-    Atomic pointer to a single activation at one (token, layer, module) position.
+    Frozen snapshot of one activation at a single (token, layer, module) position.
 
-    This is a leaf node: it holds no computation, only an address.  The
-    Executor fills in the actual tensor value via :meth:`set_cache` during
-    a forward pass.  Multiple selectors that cover overlapping positions
-    share the same ``ActivationRef`` object, guaranteeing identity and
-    avoiding duplicate extraction.
+    This is a leaf node: it holds no computation, only an address plus the
+    causal write snapshot captured when :meth:`ActivationAddress.snapshot`
+    was called.  The Executor fills in the actual tensor value via
+    :meth:`set_cache` during a forward pass.
     """
 
     def __init__(
@@ -347,9 +463,8 @@ class ActivationRefGroup(ComputationalNode):
     """
     Composite node assembling multiple atomic :class:`ActivationRef` objects.
 
-    Created automatically when the user accesses a range of tokens and/or
-    layers (e.g. ``prompt[2:5][3]["resid_post"]``).  Overlapping ranges
-    share the underlying atomic refs via the Prompt's node registry.
+    Created by freezing an :class:`ActivationAddressGroup` via
+    :meth:`ActivationAddressGroup.snapshot`.
     """
 
     def __init__(
@@ -397,6 +512,11 @@ class ConstantNode(ComputationalNode):
     """
 
     def __init__(self, value: Union[int, float, torch.Tensor]):
+        if isinstance(value, (ActivationAddress, ActivationAddressGroup)):
+            raise TypeError(
+                "Activation addresses are not values. Call .snapshot() "
+                "before using them in expressions or writes."
+            )
         if not torch.is_tensor(value):
             self.value = torch.tensor(float(value))
         else:
